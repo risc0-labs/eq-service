@@ -22,11 +22,13 @@ use nmt_rs::{
     TmSha2Hasher,
 };
 use sp1_sdk::{ProverClient, SP1Proof, SP1ProofWithPublicValues, SP1Stdin, Prover, NetworkProver};
+use tokio::sync::mpsc;
 
 use eq_common::{KeccakInclusionToDataRootProofInput, create_inclusion_proof_input};
 use serde::{Serialize, Deserialize};
 
 const KECCAK_INCLUSION_ELF: &[u8] = include_bytes!("../../target/elf-compilation/riscv32im-succinct-zkvm-elf/release/eq-program-keccak-inclusion");
+type SuccNetJobId = [u8; 32];
 
 #[derive(Serialize, Deserialize)]
 pub struct Job {
@@ -38,7 +40,7 @@ pub struct Job {
 #[derive(Serialize, Deserialize)]
 pub enum JobStatus {
     // The Succinct Network job ID
-    Pending(String),
+    Pending(SuccNetJobId),
     // For now we'll use the SP1ProofWithPublicValues as the proof
     // Ideally we only want the public values + whatever is needed to verify the proof
     // They don't seem to provide a type for that.
@@ -48,6 +50,7 @@ pub enum JobStatus {
 pub struct InclusionService {
     client: Arc<Client>,
     db: sled::Db,
+    sender: mpsc::UnboundedSender<SuccNetJobId>,
 }
 
 #[tonic::async_trait]
@@ -73,7 +76,7 @@ impl Inclusion for InclusionService {
                 JobStatus::Pending(job_id) => {
                     return Ok(Response::new(GetKeccakInclusionResponse { 
                         status: ResponseStatus::Waiting as i32, 
-                        response_value: Some(ResponseValue::ProofId(job_id))
+                        response_value: Some(ResponseValue::ProofId(job_id.to_vec()))
                     }));
                 }
                 JobStatus::Completed(proof) => {
@@ -94,6 +97,7 @@ impl Inclusion for InclusionService {
         let height = request.height;
         let commitment = Commitment::new(
             request.commitment
+            .clone()
             .try_into()
             .map_err(|_| Status::invalid_argument("Invalid commitment"))?
         );
@@ -121,16 +125,27 @@ impl Inclusion for InclusionService {
 
         let mut stdin = SP1Stdin::new();
         stdin.write(&inclusion_proof_input);
-        let request_id = network_prover
+        let request_id: [u8; 32] = network_prover
             .prove(&pk, &stdin)
             .groth16()
             .request_async()
             .await
-            .unwrap(); // TODO: Handle this error
+            .unwrap() // TODO: Handle this error
+            .into();
+
+        let job = Job {
+            height,
+            namespace: request.namespace.clone(),
+            commitment: request.commitment.clone(),
+        };
+        let job_status = JobStatus::Pending(request_id);
+
+        self.db.insert(&bincode::serialize(&job).map_err(|e| Status::internal(e.to_string()))?, bincode::serialize(&JobStatus::Pending(request_id)).map_err(|e| Status::internal(e.to_string()))?)
+            .map_err(|e| Status::internal(e.to_string()))?;
         
-        // TODO: Write a pending job to the DB, and start a worker to wait for the proof and update DB when it's complete
-        // do so in a way so the service can recover from crashes, remember which jobs it's already started, and update DB when they're finished
-        
+        self.sender.send(request_id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
         Ok(Response::new(GetKeccakInclusionResponse { status: 0, response_value: None }))
     }
 }
@@ -140,6 +155,13 @@ impl Inclusion for InclusionService {
 struct Args {
     #[arg(short, long)]
     db_path: String,
+}
+
+async fn worker(mut receiver: mpsc::UnboundedReceiver<SuccNetJobId>) {
+    println!("Worker started");
+    while let Some(job_id) = receiver.recv().await {
+        println!("Received job id: {:?}", job_id);
+    }
 }
 
 #[tokio::main]
@@ -153,10 +175,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .expect("Failed creating celestia rpc client");
 
+    let (sender, receiver) = mpsc::unbounded_channel::<SuccNetJobId>();
+
+    tokio::spawn(worker(receiver));
+
     let addr = "[::1]:50051".parse()?;
     let inclusion_service = InclusionService{
         client: Arc::new(client),
         db: db,
+        sender,
     };
 
     Server::builder()
