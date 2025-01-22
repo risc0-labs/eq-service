@@ -50,7 +50,7 @@ pub enum JobStatus {
 }
 pub struct InclusionService {
     client: Arc<Client>,
-    sender: mpsc::UnboundedSender<SuccNetJobId>,
+    sender: mpsc::UnboundedSender<(SuccNetJobId, Vec<u8>)>,
     queue_tree: SledTree,
     proof_tree: SledTree,
 }
@@ -142,12 +142,14 @@ impl Inclusion for InclusionService {
             .unwrap() // TODO: Handle this error
             .into();
 
-        // Store in queue_tree instead of db
-        self.queue_tree.insert(&job_key, bincode::serialize(&JobStatus::Pending(request_id))
-            .map_err(|e| Status::internal(e.to_string()))?)
+        // Store in queue_tree
+        let serialized_status = bincode::serialize(&JobStatus::Pending(request_id))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.queue_tree.insert(&job_key, serialized_status)
             .map_err(|e| Status::internal(e.to_string()))?;
         
-        self.sender.send(request_id)
+        // Send both job_id and key to worker
+        self.sender.send((request_id, job_key))
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(GetKeccakInclusionResponse { 
@@ -166,10 +168,43 @@ struct Args {
 }
 
 impl InclusionService {
-    async fn worker(&self, mut receiver: mpsc::UnboundedReceiver<SuccNetJobId>) {
+    async fn worker(&self, mut receiver: mpsc::UnboundedReceiver<(SuccNetJobId, Vec<u8>)>) {
         println!("Worker started");
-        while let Some(job_id) = receiver.recv().await {
+        while let Some((job_id, job_key)) = receiver.recv().await {
             println!("Received job id: {:?}", job_id);
+            tokio::spawn(self.wait_for_proof(job_id, job_key));
+        }
+    }
+
+    async fn wait_for_proof(&self, job_id: SuccNetJobId, job_key: Vec<u8>) {
+        let network_prover = ProverClient::builder().network().build();
+        
+        match network_prover.wait_proof(job_id.into(), None).await {
+            Ok(proof) => {
+                println!("Proof received for job: {:?}", job_id);
+                
+                // Store the completed proof
+                if let Ok(serialized_proof) = bincode::serialize(&JobStatus::Completed(proof)) {
+                    if let Err(e) = self.proof_tree.insert(&job_key, serialized_proof) {
+                        println!("Failed to store proof: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Error waiting for proof: {}", e);
+                
+                // Store the error
+                if let Ok(serialized_error) = bincode::serialize(&JobStatus::Failed(e.to_string())) {
+                    if let Err(e) = self.proof_tree.insert(&job_key, serialized_error) {
+                        println!("Failed to store error: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Remove from queue regardless of success/failure
+        if let Err(e) = self.queue_tree.remove(&job_key) {
+            println!("Failed to remove from queue: {}", e);
         }
     }
 }
@@ -187,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .expect("Failed creating celestia rpc client");
 
-    let (sender, receiver) = mpsc::unbounded_channel::<SuccNetJobId>();
+    let (sender, receiver) = mpsc::unbounded_channel::<(SuccNetJobId, Vec<u8>)>();
 
     tokio::spawn(worker(receiver));
 
