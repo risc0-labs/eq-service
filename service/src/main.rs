@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 
 use eq_common::{KeccakInclusionToDataRootProofInput, create_inclusion_proof_input};
 use serde::{Serialize, Deserialize};
+use sled::Tree as SledTree;
 
 const KECCAK_INCLUSION_ELF: &[u8] = include_bytes!("../../target/elf-compilation/riscv32im-succinct-zkvm-elf/release/eq-program-keccak-inclusion");
 type SuccNetJobId = [u8; 32];
@@ -49,8 +50,9 @@ pub enum JobStatus {
 }
 pub struct InclusionService {
     client: Arc<Client>,
-    db: sled::Db,
     sender: mpsc::UnboundedSender<SuccNetJobId>,
+    queue_tree: SledTree,
+    proof_tree: SledTree,
 }
 
 #[tonic::async_trait]
@@ -59,26 +61,19 @@ impl Inclusion for InclusionService {
         &self,
         request: Request<GetKeccakInclusionRequest>,
     ) -> Result<Response<GetKeccakInclusionResponse>, Status> {
-
-
         let request = request.into_inner();
-
-        let job_from_db = self.db.get(&bincode::serialize(&Job {
+        let job = Job {
             height: request.height,
             namespace: request.namespace.clone(),
             commitment: request.commitment.clone(),
-        }).map_err(|e| Status::internal(e.to_string()))?).map_err(|e| Status::internal(e.to_string()))?;
+        };
+        let job_key = bincode::serialize(&job).map_err(|e| Status::internal(e.to_string()))?;
 
-        if let Some(job) = job_from_db {
-            let job: JobStatus = bincode::deserialize(&job)
+        // First check proof_tree for completed/failed proofs
+        if let Some(proof_data) = self.proof_tree.get(&job_key).map_err(|e| Status::internal(e.to_string()))? {
+            let job_status: JobStatus = bincode::deserialize(&proof_data)
                 .map_err(|e| Status::internal(e.to_string()))?;
-            match job {
-                JobStatus::Pending(job_id) => {
-                    return Ok(Response::new(GetKeccakInclusionResponse { 
-                        status: ResponseStatus::Waiting as i32, 
-                        response_value: Some(ResponseValue::ProofId(job_id.to_vec()))
-                    }));
-                }
+            match job_status {
                 JobStatus::Completed(proof) => {
                     return Ok(Response::new(GetKeccakInclusionResponse { 
                         status: ResponseStatus::Complete as i32, 
@@ -91,9 +86,23 @@ impl Inclusion for InclusionService {
                         response_value: Some(ResponseValue::ErrorMessage(error))
                     }));
                 }
-            };
+                _ => return Err(Status::internal("Invalid state in proof_tree")),
+            }
         }
 
+        // Then check queue_tree for pending proofs
+        if let Some(queue_data) = self.queue_tree.get(&job_key).map_err(|e| Status::internal(e.to_string()))? {
+            let job_status: JobStatus = bincode::deserialize(&queue_data)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            if let JobStatus::Pending(job_id) = job_status {
+                return Ok(Response::new(GetKeccakInclusionResponse { 
+                    status: ResponseStatus::Waiting as i32, 
+                    response_value: Some(ResponseValue::ProofId(job_id.to_vec()))
+                }));
+            }
+        }
+
+        // If not found in either tree, start new proof generation
         let height = request.height;
         let commitment = Commitment::new(
             request.commitment
@@ -133,21 +142,20 @@ impl Inclusion for InclusionService {
             .unwrap() // TODO: Handle this error
             .into();
 
-        let job = Job {
-            height,
-            namespace: request.namespace.clone(),
-            commitment: request.commitment.clone(),
-        };
-        let job_status = JobStatus::Pending(request_id);
-
-        self.db.insert(&bincode::serialize(&job).map_err(|e| Status::internal(e.to_string()))?, bincode::serialize(&JobStatus::Pending(request_id)).map_err(|e| Status::internal(e.to_string()))?)
+        // Store in queue_tree instead of db
+        self.queue_tree.insert(&job_key, bincode::serialize(&JobStatus::Pending(request_id))
+            .map_err(|e| Status::internal(e.to_string()))?)
             .map_err(|e| Status::internal(e.to_string()))?;
         
         self.sender.send(request_id)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(GetKeccakInclusionResponse { status: 0, response_value: None }))
+        Ok(Response::new(GetKeccakInclusionResponse { 
+            status: ResponseStatus::Waiting as i32, 
+            response_value: Some(ResponseValue::ProofId(request_id.to_vec()))
+        }))
     }
+
 }
 
 #[derive(Parser, Debug)]
@@ -157,10 +165,12 @@ struct Args {
     db_path: String,
 }
 
-async fn worker(mut receiver: mpsc::UnboundedReceiver<SuccNetJobId>) {
-    println!("Worker started");
-    while let Some(job_id) = receiver.recv().await {
-        println!("Received job id: {:?}", job_id);
+impl InclusionService {
+    async fn worker(&self, mut receiver: mpsc::UnboundedReceiver<SuccNetJobId>) {
+        println!("Worker started");
+        while let Some(job_id) = receiver.recv().await {
+            println!("Received job id: {:?}", job_id);
+        }
     }
 }
 
@@ -169,6 +179,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     let db = sled::open(args.db_path)?;
+    let queue_tree = db.open_tree("queue")?;
+    let proof_tree = db.open_tree("proof")?;
 
     let node_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN").expect("Token not provided");
     let client = Client::new("ws://localhost:26658", Some(&node_token))
@@ -182,7 +194,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:50051".parse()?;
     let inclusion_service = InclusionService{
         client: Arc::new(client),
-        db: db,
+        queue_tree,
+        proof_tree,
         sender,
     };
 
