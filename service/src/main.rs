@@ -5,23 +5,30 @@ pub mod eqs {
     include!("generated/eqs.rs");
 }
 use eqs::inclusion_server::{Inclusion, InclusionServer};
-use eqs::{GetKeccakInclusionRequest, GetKeccakInclusionResponse, get_keccak_inclusion_response::{ResponseValue, Status as ResponseStatus}};
+use eqs::{
+    get_keccak_inclusion_response::{ResponseValue, Status as ResponseStatus},
+    GetKeccakInclusionRequest, GetKeccakInclusionResponse,
+};
 
 use celestia_rpc::{BlobClient, Client, HeaderClient};
-use celestia_types::nmt::{Namespace, NamespacedHashExt};
 use celestia_types::blob::Commitment;
+use celestia_types::nmt::{Namespace, NamespacedHashExt};
+use clap::Parser;
+use nmt_rs::{
+    simple_merkle::{
+        db::MemDb,
+        proof::Proof,
+        tree::{MerkleHash, MerkleTree},
+    },
+    TmSha2Hasher,
+};
+use sp1_sdk::{NetworkProver, Prover, ProverClient, SP1Proof, SP1ProofWithPublicValues, SP1Stdin};
+use std::cmp::max;
 use tendermint::{hash::Algorithm, Hash as TmHash};
 use tendermint_proto::{
     v0_37::{types::BlockId as RawBlockId, version::Consensus as RawConsensusVersion},
     Protobuf,
 };
-use std::cmp::max;
-use clap::{Parser};
-use nmt_rs::{
-    simple_merkle::{db::MemDb, proof::Proof, tree::{MerkleTree, MerkleHash}},
-    TmSha2Hasher,
-};
-use sp1_sdk::{ProverClient, SP1Proof, SP1ProofWithPublicValues, SP1Stdin, Prover, NetworkProver};
 use tokio::sync::mpsc;
 
 use eq_common::{KeccakInclusionToDataRootProofInput, create_inclusion_proof_input};
@@ -45,7 +52,7 @@ pub enum JobStatus {
     // For now we'll use the SP1ProofWithPublicValues as the proof
     // Ideally we only want the public values + whatever is needed to verify the proof
     // They don't seem to provide a type for that.
-    Completed(SP1ProofWithPublicValues), 
+    Completed(SP1ProofWithPublicValues),
     Failed(String),
 }
 pub struct InclusionService {
@@ -78,15 +85,18 @@ impl Inclusion for InclusionService {
                 .map_err(|e| Status::internal(e.to_string()))?;
             match job_status {
                 JobStatus::Completed(proof) => {
-                    return Ok(Response::new(GetKeccakInclusionResponse { 
-                        status: ResponseStatus::Complete as i32, 
-                        response_value: Some(ResponseValue::Proof(bincode::serialize(&proof).map_err(|e| Status::internal(e.to_string()))?))
+                    return Ok(Response::new(GetKeccakInclusionResponse {
+                        status: ResponseStatus::Complete as i32,
+                        response_value: Some(ResponseValue::Proof(
+                            bincode::serialize(&proof)
+                                .map_err(|e| Status::internal(e.to_string()))?,
+                        )),
                     }));
                 }
                 JobStatus::Failed(error) => {
-                    return Ok(Response::new(GetKeccakInclusionResponse { 
-                        status: ResponseStatus::Failed as i32, 
-                        response_value: Some(ResponseValue::ErrorMessage(error))
+                    return Ok(Response::new(GetKeccakInclusionResponse {
+                        status: ResponseStatus::Failed as i32,
+                        response_value: Some(ResponseValue::ErrorMessage(error)),
                     }));
                 }
                 _ => return Err(Status::internal("Invalid state in proof_tree")),
@@ -134,7 +144,9 @@ impl Inclusion for InclusionService {
         let nmt_multiproofs = self.client
             .blob_get_proof(height, namespace, commitment)
             .await
-            .map_err(|e| Status::internal(format!("Failed to get blob proof: {}", e.to_string())))?;
+            .map_err(|e| {
+                Status::internal(format!("Failed to get blob proof: {}", e.to_string()))
+            })?;
 
         println!("Preparing prover network request and starting proving...");
         let inclusion_proof_input = create_inclusion_proof_input(&blob, &header, nmt_multiproofs)
@@ -246,46 +258,8 @@ async fn wait_for_proof(succnet_job_id: SuccNetJobId, job: Job, proof_sender: mp
     }
 }
 
-/*async fn wait_for_proof(
-    job_id: SuccNetJobId,
-    job_key: Vec<u8>,
-    queue_db: &sled::Tree,
-    proof_db: &sled::Tree,
-) {
-    let network_prover = ProverClient::builder().network().build();
-    
-    match network_prover.wait_proof(job_id.into(), None).await {
-        Ok(proof) => {
-            println!("Proof received for job: {:?}", job_id);
-            
-            // Store the completed proof
-            if let Ok(serialized_proof) = bincode::serialize(&JobStatus::Completed(proof)) {
-                if let Err(e) = proof_db.insert(&job_key, serialized_proof) {
-                    println!("Failed to store proof: {}", e);
-                }
-            }
-        }
-        Err(e) => {
-            println!("Error waiting for proof: {}", e);
-            
-            // Store the error
-            if let Ok(serialized_error) = bincode::serialize(&JobStatus::Failed(e.to_string())) {
-                if let Err(e) = proof_db.insert(&job_key, serialized_error) {
-                    println!("Failed to store error: {}", e);
-                }
-            }
-        }
-    }
-
-    // Remove from queue regardless of success/failure
-    if let Err(e) = queue_db.remove(&job_key) {
-        println!("Failed to remove from queue: {}", e);
-    }
-}*/
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
     let args = Args::parse();
     let db = sled::open(args.db_path)?;
     let queue_tree = db.open_tree("queue")?;
