@@ -34,6 +34,7 @@ use tokio::sync::mpsc;
 use eq_common::{KeccakInclusionToDataRootProofInput, create_inclusion_proof_input};
 use serde::{Serialize, Deserialize};
 use sled::Tree as SledTree;
+use log::{debug, error, log_enabled, info, Level};
 
 const KECCAK_INCLUSION_ELF: &[u8] = include_bytes!("../../target/elf-compilation/riscv32im-succinct-zkvm-elf/release/eq-program-keccak-inclusion");
 type SuccNetJobId = [u8; 32];
@@ -69,8 +70,8 @@ impl Inclusion for InclusionService {
         &self,
         request: Request<GetKeccakInclusionRequest>,
     ) -> Result<Response<GetKeccakInclusionResponse>, Status> {
-        println!("Received request: {:?}", request);
         let request = request.into_inner();
+        info!("Received grpc request for commitment: {}", hex::encode(request.commitment.clone()));
         let job = Job {
             height: request.height,
             namespace: request.namespace.clone(),
@@ -79,7 +80,7 @@ impl Inclusion for InclusionService {
         let job_key = bincode::serialize(&job).map_err(|e| Status::internal(e.to_string()))?;
 
         // First check proof_tree for completed/failed proofs
-        println!("Checking proof_tree for completed/failed proofs");
+        debug!("Checking proof_tree for finished/failed proofs");
         if let Some(proof_data) = self.proof_tree.get(&job_key).map_err(|e| Status::internal(e.to_string()))? {
             let job_status: JobStatus = bincode::deserialize(&proof_data)
                 .map_err(|e| Status::internal(e.to_string()))?;
@@ -104,7 +105,7 @@ impl Inclusion for InclusionService {
         }
 
         // Then check queue_tree for pending proofs
-        println!("Checking queue_tree for pending proofs");
+        debug!("Checking queue_tree for pending proofs");
         if let Some(queue_data) = self.queue_tree.get(&job_key).map_err(|e| Status::internal(e.to_string()))? {
             let job_status: JobStatus = bincode::deserialize(&queue_data)
                 .map_err(|e| Status::internal(e.to_string()))?;
@@ -117,7 +118,7 @@ impl Inclusion for InclusionService {
         }
 
         // If not found in either tree, start new proof generation
-        println!("Preparing request to Celestia...");
+        debug!("Preparing request to Celestia...");
         let height = request.height;
         let commitment = Commitment::new(
             request.commitment
@@ -130,17 +131,17 @@ impl Inclusion for InclusionService {
         let namespace = Namespace::new_v0(&request.namespace)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        println!("Getting blob from Celestia...");
+        debug!("Getting blob from Celestia...");
         let blob = self.client.blob_get(height, namespace, commitment).await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         // Get the ExtendedHeader
-        println!("Getting header from Celestia...");
+        debug!("Getting header from Celestia...");
         let header = self.client.header_get_by_height(height)
             .await
             .map_err(|e| Status::internal(format!("Failed to get header: {}", e.to_string())))?;
 
-        println!("Getting NMT multiproofs from Celestia...");
+        debug!("Getting NMT multiproofs from Celestia...");
         let nmt_multiproofs = self.client
             .blob_get_proof(height, namespace, commitment)
             .await
@@ -148,7 +149,7 @@ impl Inclusion for InclusionService {
                 Status::internal(format!("Failed to get blob proof: {}", e.to_string()))
             })?;
 
-        println!("Preparing prover network request and starting proving...");
+        debug!("Preparing prover network request and starting proving...");
         let inclusion_proof_input = create_inclusion_proof_input(&blob, &header, nmt_multiproofs)
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -165,19 +166,19 @@ impl Inclusion for InclusionService {
             .unwrap() // TODO: Handle this error
             .into();
 
-        println!("Storing job in queue_tree...");
+        debug!("Storing job in queue_tree...");
         // Store in queue_tree
         let serialized_status = bincode::serialize(&JobStatus::Pending(request_id))
             .map_err(|e| Status::internal(e.to_string()))?;
         self.queue_tree.insert(&job_key, serialized_status)
             .map_err(|e| Status::internal(e.to_string()))?;
         
-        println!("Sending job to proof worker...");
+        debug!("Sending job to proof worker...");
         // Send both job_id and key to proof worker
         self.job_sender.send((request_id, job))
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        println!("Returning response...");
+        debug!("Returning response...");
         Ok(Response::new(GetKeccakInclusionResponse { 
             status: ResponseStatus::Waiting as i32, 
             response_value: Some(ResponseValue::ProofId(request_id.to_vec()))
@@ -205,37 +206,37 @@ struct Args {
 
 impl InclusionService {
     async fn job_worker(&self, mut job_receiver: mpsc::UnboundedReceiver<(SuccNetJobId, Job)>) {
-        println!("Job worker started");
+        info!("Job worker started");
         while let Some((succnet_job_id, job)) = job_receiver.recv().await {
-            println!("Received job id: {:?}", succnet_job_id);
+            debug!("job worker received succnet job id: {:?}", succnet_job_id);
             tokio::spawn(wait_for_proof(succnet_job_id, job, self.proof_sender.clone()));
         }
     }
 
     async fn db_worker(&self, mut proof_receiver: mpsc::UnboundedReceiver<(Job, SP1ProofWithPublicValues)>) {
-        println!("Proof worker started");
+        info!("Proof worker started");
         while let Some((job, proof)) = proof_receiver.recv().await {
-            println!("Received job for commitment: {:?}", job.commitment);
+            debug!("DB worker received completed proof for commitment: {}", hex::encode(job.commitment.clone()));
             let job_key = match bincode::serialize(&job) {
                 Ok(key) => key,
                 Err(e) => {
-                    println!("Failed to serialize job: {}", e);
+                    error!("Failed to serialize job: {}", e);
                     continue;
                 }
             };
             match bincode::serialize(&JobStatus::Completed(proof)) {
                 Ok(serialized_proof) => {
                     if let Err(e) = self.proof_tree.insert(&job_key, serialized_proof) {
-                        println!("Failed to store proof in tree: {}", e);
+                        error!("Failed to store proof in tree: {}", e);
                     }
                 }
                 Err(e) => {
-                    println!("Failed to serialize proof: {}", e);
+                    error!("Failed to serialize proof: {}", e);
                 }
             }
             // Remove the job from the queue after processing
             if let Err(e) = self.queue_tree.remove(&job_key) {
-                println!("Failed to remove job from queue: {}", e);
+                error!("Failed to remove job from queue: {}", e);
             }
 
         }
@@ -247,19 +248,21 @@ async fn wait_for_proof(succnet_job_id: SuccNetJobId, job: Job, proof_sender: mp
     let network_prover = ProverClient::builder().network().build();
     match network_prover.wait_proof(succnet_job_id.into(), None).await {
         Ok(proof) => {
-            println!("Proof received for job: {:?}", succnet_job_id);
+            debug!("Finished waiting for proof from succnet: {:?}", succnet_job_id);
             if let Err(e) = proof_sender.send((job, proof)) {
-                println!("Failed to send proof: {}", e);
+                error!("Failed to send proof: {}", e);
             }
         }
         Err(e) => {
-            println!("Error waiting for proof: {}", e);
+            error!("Error waiting for proof: {}", e);
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
     let args = Args::parse();
     let db = sled::open(args.db_path)?;
     let queue_tree = db.open_tree("queue")?;
@@ -299,7 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(job_status) = bincode::deserialize::<JobStatus>(&queue_data) {
                 if let JobStatus::Pending(job_id) = job_status {
                     if let Err(e) = job_sender.send((job_id, job)) {
-                        println!("Failed to send existing job to worker: {}", e);
+                        error!("Failed to send existing job to worker: {}", e);
                     } else {
                         jobs_sent_on_startup += 1;
                     }
@@ -308,7 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("Sent {} jobs on startup", jobs_sent_on_startup);
+    info!("Sent {} jobs on startup", jobs_sent_on_startup);
 
     let addr = "[::1]:50051".parse()?;
 
