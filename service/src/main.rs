@@ -50,7 +50,8 @@ pub enum JobStatus {
 }
 pub struct InclusionService {
     client: Arc<Client>,
-    sender: mpsc::UnboundedSender<(SuccNetJobId, Vec<u8>)>,
+    job_sender: mpsc::UnboundedSender<(SuccNetJobId, Job)>,
+    proof_sender: mpsc::UnboundedSender<(Job, SP1ProofWithPublicValues)>,
     queue_tree: SledTree,
     proof_tree: SledTree,
 }
@@ -148,8 +149,8 @@ impl Inclusion for InclusionService {
         self.queue_tree.insert(&job_key, serialized_status)
             .map_err(|e| Status::internal(e.to_string()))?;
         
-        // Send both job_id and key to worker
-        self.sender.send((request_id, job_key))
+        // Send both job_id and key to proof worker
+        self.job_sender.send((request_id, job))
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(GetKeccakInclusionResponse { 
@@ -160,6 +161,16 @@ impl Inclusion for InclusionService {
 
 }
 
+#[tonic::async_trait]
+impl Inclusion for Arc<InclusionService> {
+    async fn get_keccak_inclusion(
+        &self,
+        request: Request<GetKeccakInclusionRequest>,
+    ) -> Result<Response<GetKeccakInclusionResponse>, Status> {
+        (**self).get_keccak_inclusion(request).await
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -168,46 +179,91 @@ struct Args {
 }
 
 impl InclusionService {
-    async fn worker(&self, mut receiver: mpsc::UnboundedReceiver<(SuccNetJobId, Vec<u8>)>) {
-        println!("Worker started");
-        while let Some((job_id, job_key)) = receiver.recv().await {
-            println!("Received job id: {:?}", job_id);
-            tokio::spawn(self.wait_for_proof(job_id, job_key));
+    async fn job_worker(&self, mut job_receiver: mpsc::UnboundedReceiver<(SuccNetJobId, Job)>) {
+        println!("Job worker started");
+        while let Some((succnet_job_id, job)) = job_receiver.recv().await {
+            println!("Received job id: {:?}", succnet_job_id);
+            tokio::spawn(wait_for_proof(succnet_job_id, job, self.proof_sender.clone()));
         }
     }
 
-    async fn wait_for_proof(&self, job_id: SuccNetJobId, job_key: Vec<u8>) {
-        let network_prover = ProverClient::builder().network().build();
-        
-        match network_prover.wait_proof(job_id.into(), None).await {
-            Ok(proof) => {
-                println!("Proof received for job: {:?}", job_id);
-                
-                // Store the completed proof
-                if let Ok(serialized_proof) = bincode::serialize(&JobStatus::Completed(proof)) {
+    async fn db_worker(&self, mut proof_receiver: mpsc::UnboundedReceiver<(Job, SP1ProofWithPublicValues)>) {
+        println!("Proof worker started");
+        while let Some((job, proof)) = proof_receiver.recv().await {
+            println!("Received job for commitment: {:?}", job.commitment);
+            let job_key = match bincode::serialize(&job) {
+                Ok(key) => key,
+                Err(e) => {
+                    println!("Failed to serialize job: {}", e);
+                    continue;
+                }
+            };
+            match bincode::serialize(&JobStatus::Completed(proof)) {
+                Ok(serialized_proof) => {
                     if let Err(e) = self.proof_tree.insert(&job_key, serialized_proof) {
-                        println!("Failed to store proof: {}", e);
+                        println!("Failed to store proof in tree: {}", e);
                     }
                 }
-            }
-            Err(e) => {
-                println!("Error waiting for proof: {}", e);
-                
-                // Store the error
-                if let Ok(serialized_error) = bincode::serialize(&JobStatus::Failed(e.to_string())) {
-                    if let Err(e) = self.proof_tree.insert(&job_key, serialized_error) {
-                        println!("Failed to store error: {}", e);
-                    }
+                Err(e) => {
+                    println!("Failed to serialize proof: {}", e);
                 }
             }
         }
+    }
 
-        // Remove from queue regardless of success/failure
-        if let Err(e) = self.queue_tree.remove(&job_key) {
-            println!("Failed to remove from queue: {}", e);
+}
+
+async fn wait_for_proof(succnet_job_id: SuccNetJobId, job: Job, proof_sender: mpsc::UnboundedSender<(Job, SP1ProofWithPublicValues)>) {
+    let network_prover = ProverClient::builder().network().build();
+    match network_prover.wait_proof(succnet_job_id.into(), None).await {
+        Ok(proof) => {
+            println!("Proof received for job: {:?}", succnet_job_id);
+            if let Err(e) = proof_sender.send((job, proof)) {
+                println!("Failed to send proof: {}", e);
+            }
+        }
+        Err(e) => {
+            println!("Error waiting for proof: {}", e);
         }
     }
 }
+
+/*async fn wait_for_proof(
+    job_id: SuccNetJobId,
+    job_key: Vec<u8>,
+    queue_db: &sled::Tree,
+    proof_db: &sled::Tree,
+) {
+    let network_prover = ProverClient::builder().network().build();
+    
+    match network_prover.wait_proof(job_id.into(), None).await {
+        Ok(proof) => {
+            println!("Proof received for job: {:?}", job_id);
+            
+            // Store the completed proof
+            if let Ok(serialized_proof) = bincode::serialize(&JobStatus::Completed(proof)) {
+                if let Err(e) = proof_db.insert(&job_key, serialized_proof) {
+                    println!("Failed to store proof: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            println!("Error waiting for proof: {}", e);
+            
+            // Store the error
+            if let Ok(serialized_error) = bincode::serialize(&JobStatus::Failed(e.to_string())) {
+                if let Err(e) = proof_db.insert(&job_key, serialized_error) {
+                    println!("Failed to store error: {}", e);
+                }
+            }
+        }
+    }
+
+    // Remove from queue regardless of success/failure
+    if let Err(e) = queue_db.remove(&job_key) {
+        println!("Failed to remove from queue: {}", e);
+    }
+}*/
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -222,20 +278,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .expect("Failed creating celestia rpc client");
 
-    let (sender, receiver) = mpsc::unbounded_channel::<(SuccNetJobId, Vec<u8>)>();
-
-    tokio::spawn(worker(receiver));
-
-    let addr = "[::1]:50051".parse()?;
+    let (job_sender, job_receiver) = mpsc::unbounded_channel::<(SuccNetJobId, Job)>();
+    let (proof_sender, proof_receiver) = mpsc::unbounded_channel::<(Job, SP1ProofWithPublicValues)>();
     let inclusion_service = InclusionService{
         client: Arc::new(client),
-        queue_tree,
-        proof_tree,
-        sender,
+        queue_tree: queue_tree.clone(),
+        proof_tree: proof_tree.clone(),
+        job_sender: job_sender.clone(),
+        proof_sender: proof_sender.clone(),
     };
 
+    let inclusion_service = Arc::new(inclusion_service);
+
+    tokio::spawn({
+        let service = Arc::clone(&inclusion_service);
+        async move { service.job_worker(job_receiver).await }
+    });
+    tokio::spawn({
+        let service = Arc::clone(&inclusion_service);
+        async move { service.db_worker(proof_receiver).await }
+    });
+
+    let mut jobs_sent_on_startup = 0;
+    // Process any existing jobs in the queue
+    for entry_result in queue_tree.iter() {
+        if let Ok((job_key, queue_data)) = entry_result {
+            let job: Job = bincode::deserialize(&job_key).unwrap();
+            if let Ok(job_status) = bincode::deserialize::<JobStatus>(&queue_data) {
+                if let JobStatus::Pending(job_id) = job_status {
+                    if let Err(e) = job_sender.send((job_id, job)) {
+                        println!("Failed to send existing job to worker: {}", e);
+                    } else {
+                        jobs_sent_on_startup += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    println!("Sent {} jobs on startup", jobs_sent_on_startup);
+
+    let addr = "[::1]:50051".parse()?;
+
     Server::builder()
-        .add_service(InclusionServer::new(inclusion_service))
+        .add_service(InclusionServer::new(Arc::clone(&inclusion_service)))
         .serve(addr)
         .await?;
 
