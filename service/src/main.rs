@@ -31,7 +31,7 @@ use tendermint_proto::{
 };
 use tokio::sync::mpsc;
 
-use eq_common::{KeccakInclusionToDataRootProofInput, create_inclusion_proof_input};
+use eq_common::{KeccakInclusionToDataRootProofInput, create_inclusion_proof_input, InclusionServiceError};
 use serde::{Serialize, Deserialize};
 use sled::Tree as SledTree;
 use log::{debug, error, log_enabled, info, Level};
@@ -48,6 +48,8 @@ pub struct Job {
 
 #[derive(Serialize, Deserialize)]
 pub enum JobStatus {
+    // Before it goes to Prover Network, it might be hanging on Celestia
+    Waiting,
     // The Succinct Network job ID
     Pending(SuccNetJobId),
     // For now we'll use the SP1ProofWithPublicValues as the proof
@@ -58,7 +60,7 @@ pub enum JobStatus {
 }
 pub struct InclusionService {
     client: Arc<Client>,
-    job_sender: mpsc::UnboundedSender<(SuccNetJobId, Job)>,
+    job_sender: mpsc::UnboundedSender<Job>,
     proof_sender: mpsc::UnboundedSender<(Job, SP1ProofWithPublicValues)>,
     queue_tree: SledTree,
     proof_tree: SledTree,
@@ -118,14 +120,6 @@ impl Inclusion for InclusionService {
         }
 
         // If not found in either tree, start new proof generation
-        debug!("Preparing request to Celestia...");
-        let height = request.height;
-        let commitment = Commitment::new(
-            request.commitment
-            .clone()
-            .try_into()
-            .map_err(|_| Status::invalid_argument("Invalid commitment"))?
-        );
         /*let namespace = Namespace::from_raw(&request.namespace)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;*/
         let namespace = Namespace::new_v0(&request.namespace)
@@ -175,7 +169,7 @@ impl Inclusion for InclusionService {
         
         debug!("Sending job to proof worker...");
         // Send both job_id and key to proof worker
-        self.job_sender.send((request_id, job))
+        self.job_sender.send(job)
             .map_err(|e| Status::internal(e.to_string()))?;
 
         debug!("Returning response...");
@@ -205,15 +199,17 @@ struct Args {
 }
 
 impl InclusionService {
-    async fn job_worker(&self, mut job_receiver: mpsc::UnboundedReceiver<(SuccNetJobId, Job)>) {
+    async fn job_worker(&self, mut job_receiver: mpsc::UnboundedReceiver<Job>) {
         info!("Job worker started");
-        while let Some((succnet_job_id, job)) = job_receiver.recv().await {
-            debug!("job worker received succnet job id: {:?}", succnet_job_id);
-            tokio::spawn(wait_for_proof(succnet_job_id, job, self.proof_sender.clone()));
+        while let Some(job) = job_receiver.recv().await {
+            debug!("job worker received job for commitment: {}", hex::encode(job.commitment.clone()));
+            let client = Arc::clone(&self.client);
+            let proof_sender = self.proof_sender.clone();
+            tokio::spawn(prove(job, client, self.queue_tree.clone(), self.proof_tree.clone(), proof_sender));
         }
     }
 
-    async fn db_worker(&self, mut proof_receiver: mpsc::UnboundedReceiver<(Job, SP1ProofWithPublicValues)>) {
+    /*async fn db_worker(&self, mut proof_receiver: mpsc::UnboundedReceiver<(Job, SP1ProofWithPublicValues)>) {
         info!("Proof worker started");
         while let Some((job, proof)) = proof_receiver.recv().await {
             debug!("DB worker received completed proof for commitment: {}", hex::encode(job.commitment.clone()));
@@ -240,23 +236,88 @@ impl InclusionService {
             }
 
         }
-    }
+    }*/
 
 }
 
-async fn wait_for_proof(succnet_job_id: SuccNetJobId, job: Job, proof_sender: mpsc::UnboundedSender<(Job, SP1ProofWithPublicValues)>) {
+async fn prove(job: Job, client: Arc<Client>, queue_tree: SledTree, proof_tree: SledTree, proof_sender: mpsc::UnboundedSender<(Job, SP1ProofWithPublicValues)>) -> Result<(), InclusionServiceError> {
+
     let network_prover = ProverClient::builder().network().build();
-    match network_prover.wait_proof(succnet_job_id.into(), None).await {
-        Ok(proof) => {
-            debug!("Finished waiting for proof from succnet: {:?}", succnet_job_id);
-            if let Err(e) = proof_sender.send((job, proof)) {
-                error!("Failed to send proof: {}", e);
-            }
-        }
-        Err(e) => {
-            error!("Error waiting for proof: {}", e);
-        }
-    }
+    let (pk, vk) = network_prover.setup(KECCAK_INCLUSION_ELF);
+
+    let prover_network_job_id: Vec<u8> = match queue_tree.get(&bincode::serialize(&job)
+        .map_err(|e| InclusionServiceError::GeneralError(format!("Failed to serialize job: {}", e)))?)
+        .map_err(|e| InclusionServiceError::GeneralError(format!("Failed to get job from queue: {}", e)))? {
+        Some(id) => id.to_vec(),
+        None => {
+
+            debug!("Preparing request to Celestia...");
+            let height = job.height;
+
+            let commitment = Commitment::new(
+                job.commitment
+                .clone()
+                .try_into()
+                .map_err(|_| InclusionServiceError::InvalidParameter("Invalid commitment".to_string()))?
+            );
+            
+            let namespace = Namespace::new_v0(&job.namespace)
+                .map_err(|e| InclusionServiceError::InvalidParameter(format!("Invalid namespace: {}", e)))?;
+
+            debug!("Getting blob from Celestia...");
+            let blob = client.blob_get(height, namespace, commitment).await
+                .map_err(|e| {
+                    error!("Failed to get blob from Celestia: {}", e);
+                    InclusionServiceError::CelestiaError(e.to_string())
+                })?;
+
+            debug!("Getting header from Celestia...");
+            let header = client.header_get_by_height(height)
+                .await
+                .map_err(|e| InclusionServiceError::CelestiaError(e.to_string()))?;
+
+            debug!("Getting NMT multiproofs from Celestia...");
+            let nmt_multiproofs = client
+                .blob_get_proof(height, namespace, commitment)
+                .await
+                .map_err(|e| {
+                    error!("Failed to get blob proof from Celestia: {}", e);
+                    InclusionServiceError::CelestiaError(e.to_string())
+                })?;
+
+            debug!("Preparing prover network request and starting proving...");
+            let inclusion_proof_input = create_inclusion_proof_input(&blob, &header, nmt_multiproofs)
+                .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
+
+
+            let mut stdin = SP1Stdin::new();
+            stdin.write(&inclusion_proof_input);
+            let request_id: [u8; 32] = network_prover
+                .prove(&pk, &stdin)
+                .groth16()
+                .request_async()
+                .await
+                .unwrap() // TODO: Handle this error
+                .into();
+
+            debug!("Storing job in queue_tree...");
+            // Store in queue_tree
+            let serialized_status = bincode::serialize(&JobStatus::Pending(request_id))
+                .map_err(|e| InclusionServiceError::InvalidParameter(format!("Failed to serialize job status: {}", e)))?;
+
+            queue_tree.insert(&bincode::serialize(&job).map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?, serialized_status)
+                .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
+
+            request_id.to_vec()
+        },
+    };
+
+    let proof = network_prover.wait_proof(prover_network_job_id.try_into().unwrap(), None)
+        .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
+
+    proof_sender.send((job, proof)).map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -273,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .expect("Failed creating celestia rpc client");
 
-    let (job_sender, job_receiver) = mpsc::unbounded_channel::<(SuccNetJobId, Job)>();
+    let (job_sender, job_receiver) = mpsc::unbounded_channel::<Job>();
     let (proof_sender, proof_receiver) = mpsc::unbounded_channel::<(Job, SP1ProofWithPublicValues)>();
     let inclusion_service = InclusionService{
         client: Arc::new(client),
@@ -289,10 +350,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let service = Arc::clone(&inclusion_service);
         async move { service.job_worker(job_receiver).await }
     });
-    tokio::spawn({
+    /*tokio::spawn({
         let service = Arc::clone(&inclusion_service);
         async move { service.db_worker(proof_receiver).await }
-    });
+    });*/
 
     let mut jobs_sent_on_startup = 0;
     // Process any existing jobs in the queue
@@ -301,7 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let job: Job = bincode::deserialize(&job_key).unwrap();
             if let Ok(job_status) = bincode::deserialize::<JobStatus>(&queue_data) {
                 if let JobStatus::Pending(job_id) = job_status {
-                    if let Err(e) = job_sender.send((job_id, job)) {
+                    if let Err(e) = job_sender.send(job) {
                         error!("Failed to send existing job to worker: {}", e);
                     } else {
                         jobs_sent_on_startup += 1;

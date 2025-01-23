@@ -14,7 +14,7 @@ use sha3::{Keccak256, Digest};
 use celestia_types::{nmt::{NamespaceProof, NamespacedHashExt, Namespace}, blob::Blob, ExtendedHeader};
 
 mod error;
-use error::InclusionServiceError;
+pub use error::InclusionServiceError;
 
 /*
     The types of proofs we expect to support:
