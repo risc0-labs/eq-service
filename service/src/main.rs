@@ -62,6 +62,7 @@ impl Inclusion for InclusionService {
         &self,
         request: Request<GetKeccakInclusionRequest>,
     ) -> Result<Response<GetKeccakInclusionResponse>, Status> {
+        println!("Received request: {:?}", request);
         let request = request.into_inner();
         let job = Job {
             height: request.height,
@@ -71,6 +72,7 @@ impl Inclusion for InclusionService {
         let job_key = bincode::serialize(&job).map_err(|e| Status::internal(e.to_string()))?;
 
         // First check proof_tree for completed/failed proofs
+        println!("Checking proof_tree for completed/failed proofs");
         if let Some(proof_data) = self.proof_tree.get(&job_key).map_err(|e| Status::internal(e.to_string()))? {
             let job_status: JobStatus = bincode::deserialize(&proof_data)
                 .map_err(|e| Status::internal(e.to_string()))?;
@@ -92,6 +94,7 @@ impl Inclusion for InclusionService {
         }
 
         // Then check queue_tree for pending proofs
+        println!("Checking queue_tree for pending proofs");
         if let Some(queue_data) = self.queue_tree.get(&job_key).map_err(|e| Status::internal(e.to_string()))? {
             let job_status: JobStatus = bincode::deserialize(&queue_data)
                 .map_err(|e| Status::internal(e.to_string()))?;
@@ -104,6 +107,7 @@ impl Inclusion for InclusionService {
         }
 
         // If not found in either tree, start new proof generation
+        println!("Preparing request to Celestia...");
         let height = request.height;
         let commitment = Commitment::new(
             request.commitment
@@ -111,22 +115,28 @@ impl Inclusion for InclusionService {
             .try_into()
             .map_err(|_| Status::invalid_argument("Invalid commitment"))?
         );
-        let namespace = Namespace::from_raw(&request.namespace)
+        /*let namespace = Namespace::from_raw(&request.namespace)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;*/
+        let namespace = Namespace::new_v0(&request.namespace)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
+        println!("Getting blob from Celestia...");
         let blob = self.client.blob_get(height, namespace, commitment).await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         // Get the ExtendedHeader
+        println!("Getting header from Celestia...");
         let header = self.client.header_get_by_height(height)
             .await
             .map_err(|e| Status::internal(format!("Failed to get header: {}", e.to_string())))?;
 
+        println!("Getting NMT multiproofs from Celestia...");
         let nmt_multiproofs = self.client
             .blob_get_proof(height, namespace, commitment)
             .await
             .map_err(|e| Status::internal(format!("Failed to get blob proof: {}", e.to_string())))?;
 
+        println!("Preparing prover network request and starting proving...");
         let inclusion_proof_input = create_inclusion_proof_input(&blob, &header, nmt_multiproofs)
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -143,16 +153,19 @@ impl Inclusion for InclusionService {
             .unwrap() // TODO: Handle this error
             .into();
 
+        println!("Storing job in queue_tree...");
         // Store in queue_tree
         let serialized_status = bincode::serialize(&JobStatus::Pending(request_id))
             .map_err(|e| Status::internal(e.to_string()))?;
         self.queue_tree.insert(&job_key, serialized_status)
             .map_err(|e| Status::internal(e.to_string()))?;
         
+        println!("Sending job to proof worker...");
         // Send both job_id and key to proof worker
         self.job_sender.send((request_id, job))
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        println!("Returning response...");
         Ok(Response::new(GetKeccakInclusionResponse { 
             status: ResponseStatus::Waiting as i32, 
             response_value: Some(ResponseValue::ProofId(request_id.to_vec()))
@@ -208,6 +221,11 @@ impl InclusionService {
                     println!("Failed to serialize proof: {}", e);
                 }
             }
+            // Remove the job from the queue after processing
+            if let Err(e) = self.queue_tree.remove(&job_key) {
+                println!("Failed to remove job from queue: {}", e);
+            }
+
         }
     }
 
