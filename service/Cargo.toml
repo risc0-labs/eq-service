@@ -22,6 +22,9 @@ eq-common = {path = "../common"}
 clap = {workspace = true}
 sp1-sdk = {workspace=true}
 sha3 = {workspace=true}
+env_logger = {workspace=true}
+log = {workspace=true}
+hex = {workspace=true}
 
 [build-dependencies]
 tonic-build = {workspace = true}
