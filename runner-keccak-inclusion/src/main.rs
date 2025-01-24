@@ -1,11 +1,10 @@
-use celestia_types::nmt::NamespaceProof;
 use eq_common::KeccakInclusionToDataRootProofInput;
 use sp1_sdk::{ProverClient, SP1Stdin};
 use std::fs;
 
-const KECCAK_INCLUSION_ELF: &[u8] =
-    include_bytes!("../../target/release/eq-program-keccak-inclusion");
-
+const KECCAK_INCLUSION_ELF: &[u8] = include_bytes!(
+    "../../target/elf-compilation/riscv32im-succinct-zkvm-elf/release/eq-program-keccak-inclusion"
+);
 fn main() {
     sp1_sdk::utils::setup_logger();
 
@@ -20,4 +19,6 @@ fn main() {
         .execute(KECCAK_INCLUSION_ELF, &stdin)
         .run()
         .expect("Failed executing program");
+
+    print!("✅ Proof seems OK! Execution completed without issue.\n")
 }
