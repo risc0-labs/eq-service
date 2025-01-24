@@ -124,7 +124,10 @@ impl Inclusion for InclusionService {
                         response_value: None 
                     }));
                 }
-                _ => return Err(Status::internal("Expected job to be pending or waiting")),
+                _ => {
+                    error!("Expected job to be pending or waiting");
+                    return Err(Status::internal("Expected job to be pending or waiting"))
+                },
             }
         }
 
@@ -171,35 +174,6 @@ impl InclusionService {
             tokio::spawn(prove(job, client, self.queue_tree.clone(), self.proof_tree.clone(), proof_sender));
         }
     }
-
-    /*async fn db_worker(&self, mut proof_receiver: mpsc::UnboundedReceiver<(Job, SP1ProofWithPublicValues)>) {
-        info!("Proof worker started");
-        while let Some((job, proof)) = proof_receiver.recv().await {
-            debug!("DB worker received completed proof for commitment: {}", hex::encode(job.commitment.clone()));
-            let job_key = match bincode::serialize(&job) {
-                Ok(key) => key,
-                Err(e) => {
-                    error!("Failed to serialize job: {}", e);
-                    continue;
-                }
-            };
-            match bincode::serialize(&JobStatus::Completed(proof)) {
-                Ok(serialized_proof) => {
-                    if let Err(e) = self.proof_tree.insert(&job_key, serialized_proof) {
-                        error!("Failed to store proof in tree: {}", e);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to serialize proof: {}", e);
-                }
-            }
-            // Remove the job from the queue after processing
-            if let Err(e) = self.queue_tree.remove(&job_key) {
-                error!("Failed to remove job from queue: {}", e);
-            }
-
-        }
-    }*/
 
 }
 
@@ -283,6 +257,7 @@ async fn prove(job: Job, client: Arc<Client>, queue_tree: SledTree, proof_tree: 
         request_id.to_vec()
     };
 
+    debug!("Waiting for proof from prover network...");
     let prover_network_job_id: [u8; 32] = prover_network_job_id
         .try_into()
         .map_err(|e| InclusionServiceError::GeneralError(format!("Failed to convert prover network job id to [u8; 32]")))?;
@@ -335,10 +310,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let service = Arc::clone(&inclusion_service);
         async move { service.job_worker(job_receiver).await }
     });
-    /*tokio::spawn({
-        let service = Arc::clone(&inclusion_service);
-        async move { service.db_worker(proof_receiver).await }
-    });*/
 
     let mut jobs_sent_on_startup = 0;
     // Process any existing jobs in the queue
