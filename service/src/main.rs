@@ -119,59 +119,6 @@ impl Inclusion for InclusionService {
             }
         }
 
-        // If not found in either tree, start new proof generation
-        /*let namespace = Namespace::from_raw(&request.namespace)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;*/
-        let namespace = Namespace::new_v0(&request.namespace)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-
-        debug!("Getting blob from Celestia...");
-        let blob = self.client.blob_get(height, namespace, commitment).await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        // Get the ExtendedHeader
-        debug!("Getting header from Celestia...");
-        let header = self.client.header_get_by_height(height)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to get header: {}", e.to_string())))?;
-
-        debug!("Getting NMT multiproofs from Celestia...");
-        let nmt_multiproofs = self.client
-            .blob_get_proof(height, namespace, commitment)
-            .await
-            .map_err(|e| {
-                Status::internal(format!("Failed to get blob proof: {}", e.to_string()))
-            })?;
-
-        debug!("Preparing prover network request and starting proving...");
-        let inclusion_proof_input = create_inclusion_proof_input(&blob, &header, nmt_multiproofs)
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let network_prover = ProverClient::builder().network().build();
-        let (pk, vk) = network_prover.setup(KECCAK_INCLUSION_ELF);
-
-        let mut stdin = SP1Stdin::new();
-        stdin.write(&inclusion_proof_input);
-        let request_id: [u8; 32] = network_prover
-            .prove(&pk, &stdin)
-            .groth16()
-            .request_async()
-            .await
-            .unwrap() // TODO: Handle this error
-            .into();
-
-        debug!("Storing job in queue_tree...");
-        // Store in queue_tree
-        let serialized_status = bincode::serialize(&JobStatus::Pending(request_id))
-            .map_err(|e| Status::internal(e.to_string()))?;
-        self.queue_tree.insert(&job_key, serialized_status)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        
-        debug!("Sending job to proof worker...");
-        // Send both job_id and key to proof worker
-        self.job_sender.send(job)
-            .map_err(|e| Status::internal(e.to_string()))?;
-
         debug!("Returning response...");
         Ok(Response::new(GetKeccakInclusionResponse { 
             status: ResponseStatus::Waiting as i32, 
@@ -311,11 +258,24 @@ async fn prove(job: Job, client: Arc<Client>, queue_tree: SledTree, proof_tree: 
             request_id.to_vec()
         },
     };
+    let prover_network_job_id: [u8; 32] = prover_network_job_id
+        .try_into()
+        .map_err(|e| InclusionServiceError::GeneralError(format!("Failed to convert prover network job id to [u8; 32]")))?;
+    let proof = network_prover.wait_proof(prover_network_job_id.into(), None).await;
 
-    let proof = network_prover.wait_proof(prover_network_job_id.try_into().unwrap(), None)
+    debug!("Storing proof in proof_tree...");
+    let job_status = match proof {
+        Ok(proof) => JobStatus::Completed(proof),
+        Err(e) => JobStatus::Failed(e.to_string()),
+    };
+    let serialized_status = bincode::serialize(&job_status)
+        .map_err(|e| InclusionServiceError::GeneralError(format!("Failed to serialize job status: {}", e)))?;
+    proof_tree.insert(&bincode::serialize(&job).map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?, serialized_status)
         .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
 
-    proof_sender.send((job, proof)).map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
+    // Remove job from queue_tree after storing in proof_tree
+    queue_tree.remove(&bincode::serialize(&job).map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?)
+        .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
 
     Ok(())
 }
