@@ -51,14 +51,15 @@ local-mocha-node:
     echo -e "JWT for Light Node:\n$CELESTIA_NODE_AUTH_TOKEN"
     # celestia light start --p2p.network mocha --core.ip rpc-mocha.pops.one
 
-run *FLAGS: _pre-run build
+run *FLAGS: _pre-build _pre-run
     #!/usr/bin/env bash
     source .env
     cargo r -- {{ FLAGS }}
 
-run-release *FLAGS: _pre-run build-release
+run-release *FLAGS: _pre-build _pre-run
     #!/usr/bin/env bash
     source .env
+    echo $NETWORK_PRIVATE_KEY
     cargo r -r -- {{ FLAGS }}
 
 build: _pre-build

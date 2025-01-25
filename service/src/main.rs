@@ -187,7 +187,7 @@ async fn prove(
     proof_tree: SledTree,
 ) -> Result<(), InclusionServiceError> {
     let network_prover = ProverClient::builder().network().build();
-    let (pk, vk) = network_prover.setup(KECCAK_INCLUSION_ELF);
+    let (pk, _vk) = network_prover.setup(KECCAK_INCLUSION_ELF);
 
     let from_queue_tree: Option<JobStatus> = match queue_tree
         .get(&bincode::serialize(&job).map_err(|e| {
@@ -280,7 +280,8 @@ async fn prove(
     debug!("Waiting for proof from prover network...");
     let prover_network_job_id: [u8; 32] = prover_network_job_id.try_into().map_err(|e| {
         InclusionServiceError::GeneralError(format!(
-            "Failed to convert prover network job id to [u8; 32]"
+            "Failed to convert prover network job id to [u8; 32] {:?}",
+            e
         ))
     })?;
     let proof = network_prover
@@ -318,10 +319,13 @@ async fn prove(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let node_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN").expect("Token not provided");
-    let node_ws = std::env::var("CELESTIA_NODE_WS").expect("Token not provided");
-    let db_path = std::env::var("EQ_DB_PATH")?;
-    let service_socket = std::env::var("EQ_SOCKET")?;
+    std::env::var("NETWORK_PRIVATE_KEY")
+        .expect("NETWORK_PRIVATE_KEY for Succinct Prover env var reqired");
+    let node_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN")
+        .expect("CELESTIA_NODE_AUTH_TOKEN env var required");
+    let node_ws = std::env::var("CELESTIA_NODE_WS").expect("CELESTIA_NODE_WS env var required");
+    let db_path = std::env::var("EQ_DB_PATH").expect("EQ_DB_PATH env var required");
+    let service_socket = std::env::var("EQ_SOCKET").expect("EQ_SOCKET env var required");
 
     let db = sled::open(db_path)?;
     let queue_tree = db.open_tree("queue")?;
@@ -352,12 +356,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok((job_key, queue_data)) = entry_result {
             let job: Job = bincode::deserialize(&job_key).unwrap();
             if let Ok(job_status) = bincode::deserialize::<JobStatus>(&queue_data) {
-                if let JobStatus::Pending(job_id) = job_status {
-                    if let Err(e) = job_sender.send(job) {
-                        error!("Failed to send existing job to worker: {}", e);
-                    } else {
-                        jobs_sent_on_startup += 1;
+                match job_status {
+                    JobStatus::Waiting => {
+                        if let Err(e) = job_sender.send(job) {
+                            error!("Failed to send existing job to worker: {}", e);
+                        } else {
+                            jobs_sent_on_startup += 1;
+                        }
                     }
+                    JobStatus::Pending(_) => {
+                        if let Err(e) = job_sender.send(job) {
+                            error!("Failed to send existing job to worker: {}", e);
+                        } else {
+                            jobs_sent_on_startup += 1;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
