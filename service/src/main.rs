@@ -161,13 +161,22 @@ impl InclusionService {
                 "job worker received job for commitment: {}",
                 hex::encode(job.commitment.clone())
             );
+
+            // Clone what we need before spawning
             let client = Arc::clone(&self.client);
-            tokio::spawn(prove(
-                job,
-                client,
-                self.queue_db.clone(),
-                self.proof_db.clone(),
-            ));
+            let queue_db = self.queue_db.clone();
+            let proof_db = self.proof_db.clone();
+            
+            tokio::spawn(async move {
+                if let Err(e) = prove(job.clone(), client, queue_db, proof_db.clone()).await {
+                    error!("Proof generation failed: {}", e);
+                    let job_key = bincode::serialize(&job).unwrap();
+                    let failed_status = JobStatus::Failed(e.to_string());
+                    if let Err(e) = proof_db.insert(&job_key, bincode::serialize(&failed_status).unwrap()) {
+                        error!("Failed to update proof status: {}", e);
+                    }
+                }
+            });
         }
     }
 }
