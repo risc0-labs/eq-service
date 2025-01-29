@@ -50,6 +50,10 @@ pub struct KeccakInclusionToDataRootProofOutput {
     pub data_root: Vec<u8>,
 }*/
 
+pub mod eqs {
+    include!("generated/eqs.rs");
+}
+
 pub type KeccakInclusionToDataRootProofOutput = sol! {
     tuple(bytes32, bytes32)
 };

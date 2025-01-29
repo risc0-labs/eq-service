@@ -1874,11 +1874,14 @@ dependencies = [
  "alloy",
  "celestia-types",
  "nmt-rs",
+ "prost",
  "serde",
  "sha3",
  "tendermint",
  "tendermint-proto",
  "thiserror 2.0.11",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]
@@ -1896,7 +1899,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "eq-service"
+name = "eq_service"
 version = "0.1.0"
 dependencies = [
  "bincode",
@@ -1912,7 +1915,6 @@ dependencies = [
  "sp1-sdk",
  "tokio",
  "tonic",
- "tonic-build",
 ]
 
 [[package]]
