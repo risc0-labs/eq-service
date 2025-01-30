@@ -20,7 +20,6 @@ use tendermint_proto::{
     Protobuf,
 };
 use alloy::sol;
-
 mod error;
 pub use error::InclusionServiceError;
 
