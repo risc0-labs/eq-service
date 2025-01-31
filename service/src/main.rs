@@ -10,9 +10,9 @@ use eq_common::eqs::{
     GetKeccakInclusionRequest, GetKeccakInclusionResponse,
 };
 
-use celestia_rpc::{BlobClient, Client, HeaderClient};
+use celestia_rpc::{BlobClient, Client as CelestiaJSONClient, HeaderClient};
 use celestia_types::{blob::Commitment, block::Height as BlockHeight, nmt::Namespace};
-use sp1_sdk::{Prover, ProverClient, SP1ProofWithPublicValues, SP1Stdin};
+use sp1_sdk::{NetworkProver as SP1NetworkProver, Prover, SP1ProofWithPublicValues, SP1Stdin};
 use tokio::sync::mpsc;
 
 use eq_common::{
@@ -87,10 +87,27 @@ impl std::fmt::Debug for JobStatus {
 }
 
 struct InclusionService {
-    da_client: Arc<Client>,
-    job_sender: mpsc::UnboundedSender<Job>,
+    da_client: Arc<CelestiaJSONClient>,
+    sp1_client: Arc<SP1NetworkProver>,
+    proof_setup: SP1ProofSetup,
     queue_db: SledTree,
     proof_db: SledTree,
+    job_sender: mpsc::UnboundedSender<Job>,
+}
+
+#[allow(dead_code)]
+struct SP1ProofSetup {
+    pk: sp1_sdk::SP1ProvingKey,
+    vk: sp1_sdk::SP1VerifyingKey,
+}
+
+impl From<(sp1_sdk::SP1ProvingKey, sp1_sdk::SP1VerifyingKey)> for SP1ProofSetup {
+    fn from(tuple: (sp1_sdk::SP1ProvingKey, sp1_sdk::SP1VerifyingKey)) -> Self {
+        Self {
+            pk: tuple.0,
+            vk: tuple.1,
+        }
+    }
 }
 
 // I hate this workaround. Kill it with fire.
@@ -242,7 +259,7 @@ impl InclusionService {
     async fn job_worker(self: Arc<Self>, mut job_receiver: mpsc::UnboundedReceiver<Job>) {
         debug!("Job worker started");
         while let Some(job) = job_receiver.recv().await {
-            let service = Arc::clone(&self);
+            let service = self.clone();
             tokio::spawn(async move {
                 debug!("Job worker received {job:?}",);
                 let _ = service.prove(job).await; //Don't return with "?", we run keep looping
@@ -264,7 +281,7 @@ impl InclusionService {
                             .await?
                     }
                     JobStatus::DataAvalibile(proof_input) => {
-                        match Self::request_zk_proof(proof_input).await {
+                        match self.request_zk_proof(proof_input).await {
                             Ok(zk_job_id) => {
                                 debug!("DA data -> zk input ready");
                                 job_status = JobStatus::ZkProofPending(zk_job_id);
@@ -283,7 +300,7 @@ impl InclusionService {
                         };
                     }
                     JobStatus::ZkProofPending(zk_job_id) => {
-                        match Self::wait_for_zk_proof(zk_job_id).await {
+                        match self.wait_for_zk_proof(zk_job_id).await {
                             Ok(zk_proof) => {
                                 info!("🎉 {job:?} Finished!");
                                 job_status = JobStatus::ZkProofFinished(zk_proof);
@@ -306,13 +323,13 @@ impl InclusionService {
         )
     }
 
-    /// Connect to the Cestia [Client] and attempt to get a NMP for a [Job].
+    /// Connect to the Cestia [CelestiaJSONClient] and attempt to get a NMP for a [Job].
     /// A successful Result indicates that the queue DB contains valid ZKP input
     async fn get_zk_proof_input_from_da(
         &self,
         job: &Job,
         job_key: Vec<u8>,
-        client: Arc<Client>,
+        client: Arc<CelestiaJSONClient>,
     ) -> Result<(), InclusionServiceError> {
         debug!("Preparing request to Celestia...");
         let blob = client
@@ -401,16 +418,16 @@ impl InclusionService {
 
     /// Start a proof request from Succinct's prover network
     async fn request_zk_proof(
+        &self,
         proof_input: KeccakInclusionToDataRootProofInput,
     ) -> Result<SuccNetJobId, InclusionServiceError> {
         debug!("Preparing prover network request and starting proving...");
-        let network_prover = ProverClient::builder().network().build();
-        let (pk, _vk) = network_prover.setup(KECCAK_INCLUSION_ELF);
 
         let mut stdin = SP1Stdin::new();
         stdin.write(&proof_input);
-        let request_id: SuccNetJobId = network_prover
-            .prove(&pk, &stdin)
+        let request_id: SuccNetJobId = self
+            .sp1_client
+            .prove(&self.proof_setup.pk, &stdin)
             .groth16()
             .request_async()
             .await
@@ -422,14 +439,12 @@ impl InclusionService {
 
     /// Await a proof request from Succinct's prover network
     async fn wait_for_zk_proof(
+        &self,
         request_id: SuccNetJobId,
     ) -> Result<SP1ProofWithPublicValues, InclusionServiceError> {
         debug!("Waiting for proof from prover network...");
-        // TODO: can the service hold a single instance of a prover client?
-        let network_prover = ProverClient::builder().network().build();
-        let _ = network_prover.setup(KECCAK_INCLUSION_ELF);
 
-        network_prover
+        self.sp1_client
             .wait_proof(request_id.into(), None)
             .await
             .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))
@@ -496,22 +511,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue_tree = db.open_tree("queue")?;
     let proof_tree = db.open_tree("proof")?;
 
-    let client = Client::new(node_ws.as_str(), Some(&node_token))
-        .await
-        .expect("Failed creating celestia rpc client");
+    let da_client = Arc::new(
+        CelestiaJSONClient::new(node_ws.as_str(), Some(&node_token))
+            .await
+            .expect("Failed creating celestia rpc client"),
+    );
+
+    let sp1_client = Arc::new(
+        tokio::task::spawn_blocking(|| sp1_sdk::ProverClient::builder().network().build()).await?,
+    );
+
+    let prover_clone = sp1_client.clone();
+    let proof_setup: SP1ProofSetup =
+        tokio::task::spawn_blocking(move || prover_clone.setup(KECCAK_INCLUSION_ELF).into())
+            .await?;
 
     let (job_sender, job_receiver) = mpsc::unbounded_channel::<Job>();
-    let inclusion_service = InclusionService {
-        da_client: Arc::new(client),
+    let inclusion_service = Arc::new(InclusionService {
+        da_client,
+        sp1_client,
+        proof_setup,
         queue_db: queue_tree.clone(),
         proof_db: proof_tree.clone(),
         job_sender: job_sender.clone(),
-    };
-
-    let inclusion_service = Arc::new(inclusion_service);
+    });
 
     tokio::spawn({
-        let service = Arc::clone(&inclusion_service);
+        let service = inclusion_service.clone();
         async move { service.job_worker(job_receiver).await }
     });
 
@@ -545,9 +571,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = service_socket.parse()?;
 
     Server::builder()
-        .add_service(InclusionServer::new(InclusionServiceArc(Arc::clone(
-            &inclusion_service,
-        ))))
+        .add_service(InclusionServer::new(InclusionServiceArc(
+            inclusion_service.clone(),
+        )))
         .serve(addr)
         .await?;
 
