@@ -3,6 +3,7 @@ default:
 
 alias r := run
 alias rr := run-release
+alias rd := run-debug
 alias b := build
 alias br := build-release
 alias f := fmt
@@ -12,10 +13,11 @@ zkvm-elf-path := "./target/elf-compilation/riscv32im-succinct-zkvm-elf/release/e
 env-settings := "./.env"
 sp1up-path := shell("which sp1up")
 cargo-prove-path := shell("which cargo-prove")
+websocat-path := shell("which cargo-prove")
+
 
 initial-config-installs:
     #!/usr/bin/env bash
-    echo {{ path_exists(sp1up-path) }}
     if ! {{ path_exists(sp1up-path) }}; then
         curl -L https://sp1.succinct.xyz | bash
     fi
@@ -59,8 +61,23 @@ run *FLAGS: _pre-build _pre-run
 run-release *FLAGS: _pre-build _pre-run
     #!/usr/bin/env bash
     source .env
-    echo $NETWORK_PRIVATE_KEY
     cargo r -r -- {{ FLAGS }}
+
+run-debug *FLAGS: _pre-build _pre-run
+    #!/usr/bin/env bash
+    source .env
+    # Check node up with https://github.com/vi/websocat?tab=readme-ov-file#from-source
+    if ! {{ path_exists(websocat-path) }}; then
+        echo -e "⛔ Missing websocat tool.\nRun `cargo install websocat` to install"
+        exit 1
+    fi
+    if ! echo "ping" | websocat $CELESTIA_NODE_WS -1 -E &> /dev/null ; then
+        echo -e "⛔ Node not avalible @ $CELESTIA_NODE_WS - start a mocha one locally with 'just mocha' "
+        exit 1
+    fi
+
+    # export CELESTIA_NODE_AUTH_TOKEN=$(celestia light auth admin --p2p.network mocha)
+    RUST_LOG=eq_service=debug cargo r -- {{ FLAGS }}
 
 build: _pre-build
     cargo b
@@ -75,3 +92,12 @@ clean:
 fmt:
     @cargo fmt
     @just --quiet --unstable --fmt > /dev/null
+
+doc:
+    RUSTDOCFLAGS="--enable-index-page -Zunstable-options" cargo +nightly doc --no-deps --workspace
+    xdg-open {{ justfile_directory() }}/target/doc/index.html
+
+mocha:
+    # Assumes you already did init for this & configured
+    # If not, see https://docs.celestia.org/tutorials/node-tutorial#setting-up-dependencies
+    celestia light start --core.ip rpc-mocha.pops.one --p2p.network mocha
