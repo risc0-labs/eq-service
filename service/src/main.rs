@@ -13,7 +13,7 @@ use eq_common::eqs::{
 use celestia_rpc::{BlobClient, Client as CelestiaJSONClient, HeaderClient};
 use celestia_types::{blob::Commitment, block::Height as BlockHeight, nmt::Namespace};
 use sp1_sdk::{NetworkProver as SP1NetworkProver, Prover, SP1ProofWithPublicValues, SP1Stdin};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OnceCell};
 
 use eq_common::{
     create_inclusion_proof_input, InclusionServiceError, KeccakInclusionToDataRootProofInput,
@@ -26,10 +26,38 @@ use base64::Engine;
 use hex;
 use sha3::{Digest, Sha3_256};
 
-const KECCAK_INCLUSION_ELF: &[u8] = include_bytes!(
+/// A Succunct Prover Network request ID.
+/// See: https://docs.succinct.xyz/docs/generating-proofs/prover-network/usage
+type SuccNetJobId = [u8; 32];
+
+/// A SHA3 256 bit hash of a zkVM program's ELF.
+type SuccNetProgramId = [u8; 32];
+
+/// Hardcoded ELF binary for the crate `program-keccak-inclusion`
+static KECCAK_INCLUSION_ELF: &[u8] = include_bytes!(
     "../../target/elf-compilation/riscv32im-succinct-zkvm-elf/release/eq-program-keccak-inclusion"
 );
-type SuccNetJobId = [u8; 32];
+/// Hardcoded ID for the crate `program-keccak-inclusion`
+static KECCAK_INCLUSION_ID: OnceCell<SuccNetProgramId> = OnceCell::const_new();
+
+/// Hardcoded setup for the crate `program-keccak-inclusion`
+static KECCAK_INCLUSION_SETUP: OnceCell<Arc<SP1ProofSetup>> = OnceCell::const_new();
+
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize)]
+struct SP1ProofSetup {
+    pk: sp1_sdk::SP1ProvingKey,
+    vk: sp1_sdk::SP1VerifyingKey,
+}
+
+impl From<(sp1_sdk::SP1ProvingKey, sp1_sdk::SP1VerifyingKey)> for SP1ProofSetup {
+    fn from(tuple: (sp1_sdk::SP1ProvingKey, sp1_sdk::SP1VerifyingKey)) -> Self {
+        Self {
+            pk: tuple.0,
+            vk: tuple.1,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Job {
@@ -95,22 +123,6 @@ struct InclusionService {
     queue_db: SledTree,
     finished_db: SledTree,
     job_sender: mpsc::UnboundedSender<Job>,
-}
-
-#[allow(dead_code)]
-#[derive(Serialize, Deserialize)]
-struct SP1ProofSetup {
-    pk: sp1_sdk::SP1ProvingKey,
-    vk: sp1_sdk::SP1VerifyingKey,
-}
-
-impl From<(sp1_sdk::SP1ProvingKey, sp1_sdk::SP1VerifyingKey)> for SP1ProofSetup {
-    fn from(tuple: (sp1_sdk::SP1ProvingKey, sp1_sdk::SP1VerifyingKey)) -> Self {
-        Self {
-            pk: tuple.0,
-            vk: tuple.1,
-        }
-    }
 }
 
 // I hate this workaround. Kill it with fire.
@@ -285,7 +297,11 @@ impl InclusionService {
                             .await?
                     }
                     JobStatus::DataAvalibile(proof_input) => {
-                        match self.request_zk_proof(proof_input).await {
+                        // TODO handle non-hardcoded ZK programs
+                        let program_id: SuccNetProgramId = *KECCAK_INCLUSION_ID
+                            .get_or_init(|| async { Sha3_256::digest(KECCAK_INCLUSION_ELF).into() })
+                            .await;
+                        match self.request_zk_proof(program_id, proof_input).await {
                             Ok(zk_job_id) => {
                                 debug!("DA data -> zk input ready");
                                 job_status = JobStatus::ZkProofPending(zk_job_id);
@@ -330,42 +346,53 @@ impl InclusionService {
     /// Given a SHA3 hash of a ZK program, get the require setup.
     /// The setup is a very heavy task and produces a large output (~200MB),
     /// fortunately it's identical per ZK program, so we store this in a DB to recall it.
-    ///
+    /// We load it and return a pointer to a single instance of this large setup object
+    /// to read from for many concurrent [Job]s.
     async fn get_proof_setup(
         &self,
         zk_program_elf_sha3: [u8; 32],
-    ) -> Result<SP1ProofSetup, InclusionServiceError> {
+    ) -> Result<Arc<SP1ProofSetup>, InclusionServiceError> {
         debug!("Getting prover setup");
-        // Check DB for existing pre-computed setup
-        let precomputed_proof_setup = self
-            .config_db
-            .get(zk_program_elf_sha3)
-            .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
+        let setup = KECCAK_INCLUSION_SETUP
+            .get_or_try_init(|| async {
+                // Check DB for existing pre-computed setup
+                let precomputed_proof_setup = self
+                    .config_db
+                    .get(zk_program_elf_sha3)
+                    .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
 
-        let proof_setup = if let Some(precomputed) = precomputed_proof_setup {
-            bincode::deserialize(&precomputed)
-                .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?
-        } else {
-            info!("No ZK proof setup in DB for SHA3_256 = 0x{} -- generation & storing in config DB", hex::encode(zk_program_elf_sha3));
+                let proof_setup = if let Some(precomputed) = precomputed_proof_setup {
+                    bincode::deserialize(&precomputed)
+                        .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?
+                } else {
+                    info!(
+                "No ZK proof setup in DB for SHA3_256 = 0x{} -- generation & storing in config DB",
+                hex::encode(zk_program_elf_sha3)
+            );
 
-            let prover_clone = self.zk_client.clone();
-            let new_proof_setup: SP1ProofSetup = tokio::task::spawn_blocking(move || {
-                prover_clone.setup(KECCAK_INCLUSION_ELF).into()
+                    let prover_clone = self.zk_client.clone();
+                    let new_proof_setup: SP1ProofSetup = tokio::task::spawn_blocking(move || {
+                        prover_clone.setup(KECCAK_INCLUSION_ELF).into()
+                    })
+                    .await
+                    .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
+
+                    self.config_db
+                        .insert(
+                            &zk_program_elf_sha3,
+                            bincode::serialize(&new_proof_setup)
+                                .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?,
+                        )
+                        .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
+
+                    new_proof_setup
+                };
+                Ok(Arc::new(proof_setup))
             })
-            .await
-            .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
+            .await?
+            .clone();
 
-            self.config_db
-                .insert(
-                    &zk_program_elf_sha3,
-                    bincode::serialize(&new_proof_setup)
-                        .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?,
-                )
-                .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
-
-            new_proof_setup
-        };
-        Ok(proof_setup)
+        Ok(setup)
     }
 
     /// Connect to the Cestia [CelestiaJSONClient] and attempt to get a NMP for a [Job].
@@ -464,12 +491,11 @@ impl InclusionService {
     /// Start a proof request from Succinct's prover network
     async fn request_zk_proof(
         &self,
+        program_id: SuccNetProgramId,
         proof_input: KeccakInclusionToDataRootProofInput,
     ) -> Result<SuccNetJobId, InclusionServiceError> {
         debug!("Preparing prover network request and starting proving");
-        // TODO handle non-hardcoded ZK programs
-        let keccak_inclusion_id: [u8; 32] = Sha3_256::digest(KECCAK_INCLUSION_ELF).into();
-        let proof_setup = self.get_proof_setup(keccak_inclusion_id).await?;
+        let proof_setup = self.get_proof_setup(program_id).await?;
 
         let mut stdin = SP1Stdin::new();
         stdin.write(&proof_input);

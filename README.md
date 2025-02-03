@@ -110,12 +110,19 @@ grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
   -d '{"height": 4214864, "namespace": "3q2+796tvu8=", "commitment":"YcARQRj9KE/7sSXd4090FAONKkPz9ajYKIZq8liv3A0="}' \
   -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
 
+# https://mocha.celenium.io/tx/c3c301fe579feb908fe02e2e8549c38f23707d30a3d4aa73e26402d854ff9104
 grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
   -d '{"height": 4409088, "namespace": "XSUTEfJbE6VJ4A==", "commitment":"DYoAZpU7FrviV7Ui/AjQv0BpxCwexPWaOW/hQVpEl/s="}' \
   -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
 
+# https://mocha.celenium.io/tx/6ead3f794b384a9f41f58e62be4d58822626add607eefcb7ab9f0dd6b70a6abe
 grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
   -d '{"height": 4499000, "namespace": "EV1P7ciRW7PodQ==", "commitment":"mV9udfLnkNqmG/3khk2/gH0wLPx/6RinVDCTV77X3Xw="}' \
+  -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
+
+# https://mocha.celenium.io/tx/30a274a332e812df43cef70f395c413df191857ed581b68c44f05a3c5c322312
+grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
+  -d '{"height": 4499999, "namespace": "Ucwac9Zflfa95g==", "commitment":"S2iIifIPdAjQ33KPeyfAga26FSF3IL11WsCGtJKSOTA="}' \
   -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
 ```
 
