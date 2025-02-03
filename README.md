@@ -105,13 +105,17 @@ grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
   -d '{height": <block height (integer)>", "namespace": "<your_namespace_hex>", commitment": "<your_commitment_hex>"}'
   -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
 
-# Working examples using Celestia's mainnet network
+# Working examples using Celestia's mocha network
 grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
   -d '{"height": 4214864, "namespace": "3q2+796tvu8=", "commitment":"YcARQRj9KE/7sSXd4090FAONKkPz9ajYKIZq8liv3A0="}' \
   -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
 
 grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
   -d '{"height": 4409088, "namespace": "XSUTEfJbE6VJ4A==", "commitment":"DYoAZpU7FrviV7Ui/AjQv0BpxCwexPWaOW/hQVpEl/s="}' \
+  -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
+
+grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
+  -d '{"height": 4499000, "namespace": "EV1P7ciRW7PodQ==", "commitment":"mV9udfLnkNqmG/3khk2/gH0wLPx/6RinVDCTV77X3Xw="}' \
   -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
 ```
 

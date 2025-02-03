@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use sled::{Transactional, Tree as SledTree};
 
 use base64::Engine;
+use hex;
+use sha3::{Digest, Sha3_256};
 
 const KECCAK_INCLUSION_ELF: &[u8] = include_bytes!(
     "../../target/elf-compilation/riscv32im-succinct-zkvm-elf/release/eq-program-keccak-inclusion"
@@ -88,14 +90,15 @@ impl std::fmt::Debug for JobStatus {
 
 struct InclusionService {
     da_client: Arc<CelestiaJSONClient>,
-    sp1_client: Arc<SP1NetworkProver>,
-    proof_setup: SP1ProofSetup,
+    zk_client: Arc<SP1NetworkProver>,
+    config_db: SledTree,
     queue_db: SledTree,
-    proof_db: SledTree,
+    finished_db: SledTree,
     job_sender: mpsc::UnboundedSender<Job>,
 }
 
 #[allow(dead_code)]
+#[derive(Serialize, Deserialize)]
 struct SP1ProofSetup {
     pk: sp1_sdk::SP1ProvingKey,
     vk: sp1_sdk::SP1VerifyingKey,
@@ -139,14 +142,14 @@ impl Inclusion for InclusionServiceArc {
 
         let job_key = bincode::serialize(&job).map_err(|e| Status::internal(e.to_string()))?;
 
-        // First check proof_tree for completed/failed proofs
+        // Check DB for finished jobs
         if let Some(proof_data) = self
             .0
-            .proof_db
+            .finished_db
             .get(&job_key)
             .map_err(|e| Status::internal(e.to_string()))?
         {
-            debug!("Job finalized proof");
+            debug!("Job is finished, returning status");
             let job_status: JobStatus =
                 bincode::deserialize(&proof_data).map_err(|e| Status::internal(e.to_string()))?;
             match job_status {
@@ -175,14 +178,14 @@ impl Inclusion for InclusionServiceArc {
                     }));
                 }
                 _ => {
-                    let e = "Proof DB is in invalid state";
+                    let e = "Finished DB is in invalid state";
                     error!("{e}");
                     return Err(Status::internal(e));
                 }
             }
         }
 
-        // Then check queue_tree for pending proofs
+        // Check DB for pending jobs
         if let Some(queue_data) = self
             .0
             .queue_db
@@ -223,6 +226,7 @@ impl Inclusion for InclusionServiceArc {
             }
         }
 
+        // No jobs in DB, create a new one
         info!("New {job:?} sending to worker and adding to queue");
         self.0
             .queue_db
@@ -321,6 +325,47 @@ impl InclusionService {
                 }
             },
         )
+    }
+
+    /// Given a SHA3 hash of a ZK program, get the require setup.
+    /// The setup is a very heavy task and produces a large output (~200MB),
+    /// fortunately it's identical per ZK program, so we store this in a DB to recall it.
+    ///
+    async fn get_proof_setup(
+        &self,
+        zk_program_elf_sha3: [u8; 32],
+    ) -> Result<SP1ProofSetup, InclusionServiceError> {
+        debug!("Getting prover setup");
+        // Check DB for existing pre-computed setup
+        let precomputed_proof_setup = self
+            .config_db
+            .get(zk_program_elf_sha3)
+            .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
+
+        let proof_setup = if let Some(precomputed) = precomputed_proof_setup {
+            bincode::deserialize(&precomputed)
+                .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?
+        } else {
+            info!("No ZK proof setup in DB for SHA3_256 = 0x{} -- generation & storing in config DB", hex::encode(zk_program_elf_sha3));
+
+            let prover_clone = self.zk_client.clone();
+            let new_proof_setup: SP1ProofSetup = tokio::task::spawn_blocking(move || {
+                prover_clone.setup(KECCAK_INCLUSION_ELF).into()
+            })
+            .await
+            .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
+
+            self.config_db
+                .insert(
+                    &zk_program_elf_sha3,
+                    bincode::serialize(&new_proof_setup)
+                        .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?,
+                )
+                .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
+
+            new_proof_setup
+        };
+        Ok(proof_setup)
     }
 
     /// Connect to the Cestia [CelestiaJSONClient] and attempt to get a NMP for a [Job].
@@ -422,12 +467,15 @@ impl InclusionService {
         proof_input: KeccakInclusionToDataRootProofInput,
     ) -> Result<SuccNetJobId, InclusionServiceError> {
         debug!("Preparing prover network request and starting proving");
+        // TODO handle non-hardcoded ZK programs
+        let keccak_inclusion_id: [u8; 32] = Sha3_256::digest(KECCAK_INCLUSION_ELF).into();
+        let proof_setup = self.get_proof_setup(keccak_inclusion_id).await?;
 
         let mut stdin = SP1Stdin::new();
         stdin.write(&proof_input);
         let request_id: SuccNetJobId = self
-            .sp1_client
-            .prove(&self.proof_setup.pk, &stdin)
+            .zk_client
+            .prove(&proof_setup.pk, &stdin)
             .groth16()
             .request_async()
             .await
@@ -444,7 +492,7 @@ impl InclusionService {
     ) -> Result<SP1ProofWithPublicValues, InclusionServiceError> {
         debug!("Waiting for proof from prover network");
 
-        self.sp1_client
+        self.zk_client
             .wait_proof(request_id.into(), None)
             .await
             .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))
@@ -460,10 +508,10 @@ impl InclusionService {
         job_status: JobStatus,
     ) -> Result<(), InclusionServiceError> {
         // TODO: do we want to do a status check here? To prevent accidenily getting into a DB invalid state
-        (&self.queue_db, &self.proof_db)
-            .transaction(|(queue_tx, proof_tx)| {
+        (&self.queue_db, &self.finished_db)
+            .transaction(|(queue_tx, finished_tx)| {
                 queue_tx.remove(job_key.clone())?;
-                proof_tx.insert(job_key.clone(), bincode::serialize(&job_status).unwrap())?;
+                finished_tx.insert(job_key.clone(), bincode::serialize(&job_status).unwrap())?;
                 Ok::<(), sled::transaction::ConflictableTransactionError<InclusionServiceError>>(())
             })
             .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
@@ -511,8 +559,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("EQ_SOCKET env var reqired");
 
     let db = sled::open(db_path)?;
-    let queue_tree = db.open_tree("queue")?;
-    let proof_tree = db.open_tree("proof")?;
+    let queue_db = db.open_tree("queue")?;
+    let finished_db = db.open_tree("finished")?;
+    let config_db = db.open_tree("config")?;
 
     info!("Running preflight setup");
 
@@ -524,24 +573,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     debug!("Building prover client");
-    let sp1_client = Arc::new(
+    let zk_client = Arc::new(
         tokio::task::spawn_blocking(|| sp1_sdk::ProverClient::builder().network().build()).await?,
     );
-
-    debug!("Generating prover setup");
-    let prover_clone = sp1_client.clone();
-    let proof_setup: SP1ProofSetup =
-        tokio::task::spawn_blocking(move || prover_clone.setup(KECCAK_INCLUSION_ELF).into())
-            .await?;
 
     debug!("Starting service");
     let (job_sender, job_receiver) = mpsc::unbounded_channel::<Job>();
     let inclusion_service = Arc::new(InclusionService {
         da_client,
-        sp1_client,
-        proof_setup,
-        queue_db: queue_tree.clone(),
-        proof_db: proof_tree.clone(),
+        zk_client,
+        config_db: config_db.clone(),
+        queue_db: queue_db.clone(),
+        finished_db: finished_db.clone(),
         job_sender: job_sender.clone(),
     });
 
@@ -551,7 +594,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     debug!("Restarting unfinised jobs");
-    for entry_result in queue_tree.iter() {
+    for entry_result in queue_db.iter() {
         if let Ok((job_key, queue_data)) = entry_result {
             let job: Job = bincode::deserialize(&job_key).unwrap();
             debug!("Sending {job:?}");
