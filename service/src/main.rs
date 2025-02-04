@@ -40,6 +40,16 @@ static KECCAK_INCLUSION_ELF: &[u8] = include_bytes!(
 /// Hardcoded ID for the crate `program-keccak-inclusion`
 static KECCAK_INCLUSION_ID: OnceCell<SuccNetProgramId> = OnceCell::const_new();
 
+/// Given a hard coded ELF, get it's ID
+/// TODO: generalize
+async fn get_program_id() -> SuccNetProgramId {
+    *KECCAK_INCLUSION_ID
+        .get_or_init(|| async {
+            debug!("Building Program ID");
+            Sha3_256::digest(KECCAK_INCLUSION_ELF).into() })
+        .await
+}
+
 /// Hardcoded setup for the crate `program-keccak-inclusion`
 static KECCAK_INCLUSION_SETUP: OnceCell<Arc<SP1ProofSetup>> = OnceCell::const_new();
 
@@ -306,10 +316,7 @@ impl InclusionService {
                     }
                     JobStatus::DataAvalibile(proof_input) => {
                         // TODO handle non-hardcoded ZK programs
-                        let program_id: SuccNetProgramId = *KECCAK_INCLUSION_ID
-                            .get_or_init(|| async { Sha3_256::digest(KECCAK_INCLUSION_ELF).into() })
-                            .await;
-                        match self.request_zk_proof(program_id, proof_input).await {
+                        match self.request_zk_proof(get_program_id().await, proof_input).await {
                             Ok(zk_job_id) => {
                                 debug!("DA data -> zk input ready");
                                 job_status = JobStatus::ZkProofPending(zk_job_id);
@@ -375,9 +382,9 @@ impl InclusionService {
                         .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?
                 } else {
                     info!(
-                "No ZK proof setup in DB for SHA3_256 = 0x{} -- generation & storing in config DB",
-                hex::encode(zk_program_elf_sha3)
-            );
+                        "No ZK proof setup in DB for SHA3_256 = 0x{} -- generation & storing in config DB",
+                        hex::encode(zk_program_elf_sha3)
+                    );
 
                     let new_proof_setup: SP1ProofSetup = tokio::task::spawn_blocking(move || {
                         zk_client_handle.setup(KECCAK_INCLUSION_ELF).into()
@@ -631,7 +638,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let finished_db = db.open_tree("finished")?;
     let config_db = db.open_tree("config")?;
 
-    info!("Running preflight setup");
+    info!("Building clients and service setup");
     let (job_sender, job_receiver) = mpsc::unbounded_channel::<Job>();
     let inclusion_service = Arc::new(InclusionService {
         config: InclusionServiceConfig {
@@ -649,8 +656,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn({
         let service = inclusion_service.clone();
         async move {
-            service.clone().get_zk_client_remote().await;
-            debug!("ZK client ready!");
+            let program_id = get_program_id().await;
+            let zk_client = service.clone().get_zk_client_remote().await;
+            debug!("ZK client prepared, aquiring setup");
+            let _ = service.get_proof_setup(program_id, zk_client).await;
+            info!("ZK client ready!");
         }
         // TODO: crash whole program if this fails
     });
@@ -665,7 +675,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let service = inclusion_service.clone();
         async move {
             service.clone().get_da_client().await;
-            debug!("DA client ready!");
+            info!("DA client ready!");
         }
         // TODO: crash whole program if this fails
     });
@@ -703,3 +713,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
