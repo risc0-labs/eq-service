@@ -43,6 +43,10 @@ static KECCAK_INCLUSION_ID: OnceCell<SuccNetProgramId> = OnceCell::const_new();
 /// Hardcoded setup for the crate `program-keccak-inclusion`
 static KECCAK_INCLUSION_SETUP: OnceCell<Arc<SP1ProofSetup>> = OnceCell::const_new();
 
+static ZK_CLIENT_REMOTE: OnceCell<Arc<SP1NetworkProver>> = OnceCell::const_new();
+
+static DA_CLIENT_REMOTE: OnceCell<Arc<CelestiaJSONClient>> = OnceCell::const_new();
+
 #[allow(dead_code)]
 #[derive(Serialize, Deserialize)]
 struct SP1ProofSetup {
@@ -116,9 +120,8 @@ impl std::fmt::Debug for JobStatus {
     }
 }
 
+/// The main service, depends on external DA and ZK clients internally!
 struct InclusionService {
-    da_client: Arc<CelestiaJSONClient>,
-    zk_client: Arc<SP1NetworkProver>,
     config_db: SledTree,
     queue_db: SledTree,
     finished_db: SledTree,
@@ -293,7 +296,15 @@ impl InclusionService {
                 debug!("Job worker processing with starting status: {job_status:?}");
                 match job_status {
                     JobStatus::DataAvalibilityPending => {
-                        self.get_zk_proof_input_from_da(&job, job_key, self.da_client.clone())
+                        let da_client_handle = DA_CLIENT_REMOTE
+                            .get()
+                            .ok_or_else(|| {
+                                InclusionServiceError::DaClientError(
+                                    "DA Client not ready".to_string(),
+                                )
+                            })?
+                            .clone();
+                        self.get_zk_proof_input_from_da(&job, job_key, da_client_handle)
                             .await?
                     }
                     JobStatus::DataAvalibile(proof_input) => {
@@ -351,6 +362,7 @@ impl InclusionService {
     async fn get_proof_setup(
         &self,
         zk_program_elf_sha3: [u8; 32],
+        zk_client_handle: Arc<SP1NetworkProver>,
     ) -> Result<Arc<SP1ProofSetup>, InclusionServiceError> {
         debug!("Getting prover setup");
         let setup = KECCAK_INCLUSION_SETUP
@@ -370,9 +382,8 @@ impl InclusionService {
                 hex::encode(zk_program_elf_sha3)
             );
 
-                    let prover_clone = self.zk_client.clone();
                     let new_proof_setup: SP1ProofSetup = tokio::task::spawn_blocking(move || {
-                        prover_clone.setup(KECCAK_INCLUSION_ELF).into()
+                        zk_client_handle.setup(KECCAK_INCLUSION_ELF).into()
                     })
                     .await
                     .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?;
@@ -414,7 +425,7 @@ impl InclusionService {
             .await
             .map_err(|e| {
                 error!("Failed to get header proof from Celestia: {}", e);
-                InclusionServiceError::CelestiaError(e.to_string())
+                InclusionServiceError::DaClientError(e.to_string())
             })?;
 
         let nmt_multiproofs = client
@@ -422,7 +433,7 @@ impl InclusionService {
             .await
             .map_err(|e| {
                 error!("Failed to get blob proof from Celestia: {}", e);
-                InclusionServiceError::CelestiaError(e.to_string())
+                InclusionServiceError::DaClientError(e.to_string())
             })?;
 
         debug!("Creating ZK Proof input from Celestia Data");
@@ -437,7 +448,7 @@ impl InclusionService {
         }
 
         error!("Failed to get proof from Celestia - This should be unrechable!");
-        Err(InclusionServiceError::CelestiaError(format!(
+        Err(InclusionServiceError::DaClientError(format!(
             "Could not obtain NMT proof of data inclusion"
         )))
     }
@@ -457,25 +468,25 @@ impl InclusionService {
             JsonRpcError::Call(error_object) => {
                 // TODO: make this handle errors much better! JSON stringyness is a problem!
                 if error_object.message() == "header: not found" {
-                    e = InclusionServiceError::CelestiaError("header: not found. Likely Celestia Node is missing blob, although it exists on the network overall.".to_string());
+                    e = InclusionServiceError::DaClientError("header: not found. Likely Celestia Node is missing blob, although it exists on the network overall.".to_string());
                     error!("{job:?} failed, recoverable: {e}");
                     job_status = JobStatus::Failed(
                         e.clone(),
                         Some(JobStatus::DataAvalibilityPending.into()),
                     );
                 } else if error_object.message() == "blob: not found" {
-                    e = InclusionServiceError::CelestiaError("blob: not found".to_string());
+                    e = InclusionServiceError::DaClientError("blob: not found".to_string());
                     error!("{job:?} failed, not recoverable: {e}");
                     job_status = JobStatus::Failed(e.clone(), None);
                 } else {
-                    e = InclusionServiceError::CelestiaError("UNKNOWN client error".to_string());
+                    e = InclusionServiceError::DaClientError("UNKNOWN client error".to_string());
                     error!("{job:?} failed, not recoverable: {e}");
                     job_status = JobStatus::Failed(e.clone(), None);
                 }
             }
             // TODO: handle other Celestia JSON RPC errors
             _ => {
-                e = InclusionServiceError::CelestiaError(
+                e = InclusionServiceError::DaClientError(
                     "Unhandled Celestia SDK error".to_string(),
                 );
                 error!("{job:?} failed, not recoverable: {e}");
@@ -495,12 +506,17 @@ impl InclusionService {
         proof_input: KeccakInclusionToDataRootProofInput,
     ) -> Result<SuccNetJobId, InclusionServiceError> {
         debug!("Preparing prover network request and starting proving");
-        let proof_setup = self.get_proof_setup(program_id).await?;
+        let zk_client_handle = ZK_CLIENT_REMOTE
+            .get()
+            .ok_or_else(|| InclusionServiceError::ZkClientError("ZK Client not ready".to_string()))?
+            .clone();
+        let proof_setup = self
+            .get_proof_setup(program_id, zk_client_handle.clone())
+            .await?;
 
         let mut stdin = SP1Stdin::new();
         stdin.write(&proof_input);
-        let request_id: SuccNetJobId = self
-            .zk_client
+        let request_id: SuccNetJobId = zk_client_handle
             .prove(&proof_setup.pk, &stdin)
             .groth16()
             .request_async()
@@ -517,8 +533,12 @@ impl InclusionService {
         request_id: SuccNetJobId,
     ) -> Result<SP1ProofWithPublicValues, InclusionServiceError> {
         debug!("Waiting for proof from prover network");
+        let zk_client_handle = ZK_CLIENT_REMOTE
+            .get()
+            .ok_or_else(|| InclusionServiceError::ZkClientError("ZK Client not ready".to_string()))?
+            .clone();
 
-        self.zk_client
+        zk_client_handle
             .wait_proof(request_id.into(), None)
             .await
             .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))
@@ -569,6 +589,35 @@ impl InclusionService {
     }
 }
 
+async fn get_zk_client_remote() -> Result<Arc<SP1NetworkProver>, InclusionServiceError> {
+    let handle = ZK_CLIENT_REMOTE
+        .get_or_init(|| async {
+            debug!("Building prover client");
+            let client = sp1_sdk::ProverClient::builder().network().build();
+            Arc::new(client)
+        })
+        .await
+        .clone();
+    Ok(handle)
+}
+
+async fn get_da_client(
+    socket: String,
+    token: String,
+) -> Result<Arc<CelestiaJSONClient>, InclusionServiceError> {
+    let handle = DA_CLIENT_REMOTE
+        .get_or_init(|| async {
+            debug!("Building DA client");
+            let client = CelestiaJSONClient::new(socket.as_str(), Some(&token))
+                .await
+                .expect("Failed to build Celestia Client RPC");
+            Arc::new(client)
+        })
+        .await
+        .clone();
+    Ok(handle)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -591,23 +640,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Running preflight setup");
 
-    debug!("Building DA client");
-    let da_client = Arc::new(
-        CelestiaJSONClient::new(node_ws.as_str(), Some(&node_token))
-            .await
-            .expect("Failed creating celestia rpc client"),
-    );
-
-    debug!("Building prover client");
-    let zk_client = Arc::new(
-        tokio::task::spawn_blocking(|| sp1_sdk::ProverClient::builder().network().build()).await?,
-    );
+    // Trigger background initialization without awaiting.
+    tokio::spawn(async move {
+        if let Err(e) = get_da_client(node_ws, node_token).await {
+            error!("Failed to initialize DA client: {:?}", e);
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(e) = get_zk_client_remote().await {
+            error!("Failed to initialize ZK client: {:?}", e);
+        }
+    });
 
     debug!("Starting service");
     let (job_sender, job_receiver) = mpsc::unbounded_channel::<Job>();
     let inclusion_service = Arc::new(InclusionService {
-        da_client,
-        zk_client,
         config_db: config_db.clone(),
         queue_db: queue_db.clone(),
         finished_db: finished_db.clone(),

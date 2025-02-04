@@ -15,11 +15,14 @@ pub enum InclusionServiceError {
     #[error("Failed to convert shares to blob: {0}")]
     ShareConversionError(String),
 
-    #[error("Failed to create inclusion proof input: {0}")]
+    #[error("Failed with: {0}")]
     GeneralError(String),
 
-    #[error("Failed to query Celestia: {0}")]
-    CelestiaError(String),
+    #[error("{0}")]
+    ZkClientError(String),
+
+    #[error("{0}")]
+    DaClientError(String),
 
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
