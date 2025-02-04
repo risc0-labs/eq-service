@@ -43,10 +43,6 @@ static KECCAK_INCLUSION_ID: OnceCell<SuccNetProgramId> = OnceCell::const_new();
 /// Hardcoded setup for the crate `program-keccak-inclusion`
 static KECCAK_INCLUSION_SETUP: OnceCell<Arc<SP1ProofSetup>> = OnceCell::const_new();
 
-static ZK_CLIENT_REMOTE: OnceCell<Arc<SP1NetworkProver>> = OnceCell::const_new();
-
-static DA_CLIENT_REMOTE: OnceCell<Arc<CelestiaJSONClient>> = OnceCell::const_new();
-
 #[allow(dead_code)]
 #[derive(Serialize, Deserialize)]
 struct SP1ProofSetup {
@@ -122,10 +118,18 @@ impl std::fmt::Debug for JobStatus {
 
 /// The main service, depends on external DA and ZK clients internally!
 struct InclusionService {
+    config: InclusionServiceConfig,
+    da_client_handle: OnceCell<Arc<CelestiaJSONClient>>,
+    zk_client_handle: OnceCell<Arc<SP1NetworkProver>>,
     config_db: SledTree,
     queue_db: SledTree,
     finished_db: SledTree,
     job_sender: mpsc::UnboundedSender<Job>,
+}
+
+struct InclusionServiceConfig {
+    da_node_token: String,
+    da_node_ws: String,
 }
 
 // I hate this workaround. Kill it with fire.
@@ -296,14 +300,7 @@ impl InclusionService {
                 debug!("Job worker processing with starting status: {job_status:?}");
                 match job_status {
                     JobStatus::DataAvalibilityPending => {
-                        let da_client_handle = DA_CLIENT_REMOTE
-                            .get()
-                            .ok_or_else(|| {
-                                InclusionServiceError::DaClientError(
-                                    "DA Client not ready".to_string(),
-                                )
-                            })?
-                            .clone();
+                        let da_client_handle = self.get_da_client().await.clone();
                         self.get_zk_proof_input_from_da(&job, job_key, da_client_handle)
                             .await?
                     }
@@ -506,10 +503,7 @@ impl InclusionService {
         proof_input: KeccakInclusionToDataRootProofInput,
     ) -> Result<SuccNetJobId, InclusionServiceError> {
         debug!("Preparing prover network request and starting proving");
-        let zk_client_handle = ZK_CLIENT_REMOTE
-            .get()
-            .ok_or_else(|| InclusionServiceError::ZkClientError("ZK Client not ready".to_string()))?
-            .clone();
+        let zk_client_handle = self.get_zk_client_remote().await;
         let proof_setup = self
             .get_proof_setup(program_id, zk_client_handle.clone())
             .await?;
@@ -533,10 +527,7 @@ impl InclusionService {
         request_id: SuccNetJobId,
     ) -> Result<SP1ProofWithPublicValues, InclusionServiceError> {
         debug!("Waiting for proof from prover network");
-        let zk_client_handle = ZK_CLIENT_REMOTE
-            .get()
-            .ok_or_else(|| InclusionServiceError::ZkClientError("ZK Client not ready".to_string()))?
-            .clone();
+        let zk_client_handle = self.get_zk_client_remote().await;
 
         zk_client_handle
             .wait_proof(request_id.into(), None)
@@ -587,35 +578,37 @@ impl InclusionService {
             .send(job)
             .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?)
     }
-}
 
-async fn get_zk_client_remote() -> Result<Arc<SP1NetworkProver>, InclusionServiceError> {
-    let handle = ZK_CLIENT_REMOTE
-        .get_or_init(|| async {
-            debug!("Building prover client");
-            let client = sp1_sdk::ProverClient::builder().network().build();
-            Arc::new(client)
-        })
-        .await
-        .clone();
-    Ok(handle)
-}
-
-async fn get_da_client(
-    socket: String,
-    token: String,
-) -> Result<Arc<CelestiaJSONClient>, InclusionServiceError> {
-    let handle = DA_CLIENT_REMOTE
-        .get_or_init(|| async {
-            debug!("Building DA client");
-            let client = CelestiaJSONClient::new(socket.as_str(), Some(&token))
+    async fn get_da_client(&self) -> Arc<CelestiaJSONClient> {
+        let handle = self
+            .da_client_handle
+            .get_or_init(|| async {
+                debug!("Building DA client");
+                let client = CelestiaJSONClient::new(
+                    self.config.da_node_ws.as_str(),
+                    self.config.da_node_token.as_str().into(),
+                )
                 .await
                 .expect("Failed to build Celestia Client RPC");
-            Arc::new(client)
-        })
-        .await
-        .clone();
-    Ok(handle)
+                Arc::new(client)
+            })
+            .await
+            .clone();
+        handle
+    }
+
+    async fn get_zk_client_remote(&self) -> Arc<SP1NetworkProver> {
+        let handle = self
+            .zk_client_handle
+            .get_or_init(|| async {
+                debug!("Building prover client");
+                let client = sp1_sdk::ProverClient::builder().network().build();
+                Arc::new(client)
+            })
+            .await
+            .clone();
+        handle
+    }
 }
 
 #[tokio::main]
@@ -624,37 +617,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     std::env::var("NETWORK_PRIVATE_KEY")
         .expect("NETWORK_PRIVATE_KEY for Succinct Prover env var reqired");
-    let node_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN")
+    let da_node_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN")
         .expect("CELESTIA_NODE_AUTH_TOKEN env var required");
-    let node_ws = std::env::var("CELESTIA_NODE_WS").expect("CELESTIA_NODE_WS env var required");
+    let da_node_ws = std::env::var("CELESTIA_NODE_WS").expect("CELESTIA_NODE_WS env var required");
     let db_path = std::env::var("EQ_DB_PATH").expect("EQ_DB_PATH env var required");
     let service_socket: std::net::SocketAddr = std::env::var("EQ_SOCKET")
         .expect("EQ_SOCKET env var required")
         .parse()
         .expect("EQ_SOCKET env var reqired");
 
-    let db = sled::open(db_path)?;
+    let db = sled::open(db_path.clone())?;
     let queue_db = db.open_tree("queue")?;
     let finished_db = db.open_tree("finished")?;
     let config_db = db.open_tree("config")?;
 
     info!("Running preflight setup");
-
-    // Trigger background initialization without awaiting.
-    tokio::spawn(async move {
-        if let Err(e) = get_da_client(node_ws, node_token).await {
-            error!("Failed to initialize DA client: {:?}", e);
-        }
-    });
-    tokio::spawn(async move {
-        if let Err(e) = get_zk_client_remote().await {
-            error!("Failed to initialize ZK client: {:?}", e);
-        }
-    });
-
-    debug!("Starting service");
     let (job_sender, job_receiver) = mpsc::unbounded_channel::<Job>();
     let inclusion_service = Arc::new(InclusionService {
+        config: InclusionServiceConfig {
+            da_node_token,
+            da_node_ws,
+        },
+        da_client_handle: OnceCell::new(),
+        zk_client_handle: OnceCell::new(),
         config_db: config_db.clone(),
         queue_db: queue_db.clone(),
         finished_db: finished_db.clone(),
@@ -663,7 +648,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn({
         let service = inclusion_service.clone();
+        async move {
+            service.clone().get_zk_client_remote().await;
+            debug!("ZK client ready!");
+        }
+        // TODO: crash whole program if this fails
+    });
+
+    debug!("Starting service");
+    tokio::spawn({
+        let service = inclusion_service.clone();
         async move { service.job_worker(job_receiver).await }
+    });
+
+    tokio::spawn({
+        let service = inclusion_service.clone();
+        async move {
+            service.clone().get_da_client().await;
+            debug!("DA client ready!");
+        }
+        // TODO: crash whole program if this fails
     });
 
     debug!("Restarting unfinised jobs");
