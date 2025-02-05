@@ -343,7 +343,7 @@ impl InclusionService {
                     JobStatus::DataAvalibile(proof_input) => {
                         // TODO handle non-hardcoded ZK programs
                         match self
-                            .request_zk_proof(get_program_id().await, proof_input)
+                            .request_zk_proof(&get_program_id().await, &proof_input)
                             .await
                         {
                             Ok(zk_job_id) => {
@@ -359,7 +359,7 @@ impl InclusionService {
                                 error!("{job:?} failed progressing DataAvalibile: {e}");
                                 job_status = JobStatus::Failed(
                                     e,
-                                    Some(JobStatus::DataAvalibile(proof_input)),
+                                    Some(JobStatus::DataAvalibile(proof_input).into()),
                                 );
                                 self.finalize_job(&job_key, job_status)?;
                             }
@@ -378,7 +378,7 @@ impl InclusionService {
                                 error!("{job:?} failed progressing ZkProofPending: {e}");
                                 job_status = JobStatus::Failed(
                                     e,
-                                    Some(JobStatus::ZkProofPending(zk_request_id)),
+                                    Some(JobStatus::ZkProofPending(zk_request_id).into()),
                                 );
                                 self.finalize_job(&job_key, job_status)?;
                             }
@@ -398,7 +398,7 @@ impl InclusionService {
     /// to read from for many concurrent [Job]s.
     async fn get_proof_setup(
         &self,
-        zk_program_elf_sha3: [u8; 32],
+        zk_program_elf_sha3: &[u8; 32],
         zk_client_handle: Arc<SP1NetworkProver>,
     ) -> Result<Arc<SP1ProofSetup>, InclusionServiceError> {
         debug!("Getting ZK program proof setup");
@@ -547,8 +547,8 @@ impl InclusionService {
     /// Start a proof request from Succinct's prover network
     async fn request_zk_proof(
         &self,
-        program_id: SuccNetProgramId,
-        proof_input: KeccakInclusionToDataRootProofInput,
+        program_id: &SuccNetProgramId,
+        proof_input: &KeccakInclusionToDataRootProofInput,
     ) -> Result<SuccNetJobId, InclusionServiceError> {
         debug!("Preparing prover network request and starting proving");
         let zk_client_handle = self.get_zk_client_remote().await;
@@ -723,7 +723,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let program_id = get_program_id().await;
             let zk_client = service.clone().get_zk_client_remote().await;
             debug!("ZK client prepared, aquiring setup");
-            let _ = service.get_proof_setup(program_id, zk_client).await;
+            let _ = service.get_proof_setup(&program_id, zk_client).await;
             info!("ZK client ready!");
         }
         // TODO: crash whole program if this fails
