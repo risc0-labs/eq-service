@@ -472,44 +472,6 @@ impl InclusionService {
         )))
     }
 
-    /// Helper function to handle status from a ZK client.
-    /// Will finalize the job in an [JobStatus::Failed] state,
-    /// that may be retryable.
-    fn handle_zk_client_status(
-        &self,
-        zk_client_status: SuccNetFulfillmentStatus,
-        job: &Job,
-        job_key: &Vec<u8>,
-        request_id: SuccNetJobId,
-    ) -> InclusionServiceError {
-        debug!("Succinct Status: {}", zk_client_status.as_str_name());
-        let (e, job_status);
-        match zk_client_status {
-            SuccNetFulfillmentStatus::Unfulfillable => {
-                e = InclusionServiceError::ZkClientError(
-                    "Unfulfillable. PLEASE REPORT!".to_string(),
-                );
-                error!("{job:?} failed, NOT recoverable: {e}");
-                job_status = JobStatus::Failed(e.clone(), None);
-            }
-            _ => {
-                e = InclusionServiceError::DaClientError(
-                    "Unhandled Succinct Network status. PLEASE REPORT! Retryable.".to_string(),
-                );
-                error!("{job:?} failed, retryable: {e}");
-                job_status = JobStatus::Failed(
-                    e.clone(),
-                    Some(JobStatus::ZkProofPending(request_id).into()),
-                );
-            }
-        };
-
-        match self.finalize_job(job_key, job_status) {
-            Ok(_) => return e,
-            Err(internal_err) => return internal_err,
-        };
-    }
-
     /// Helper function to handle error from a [jsonrpsee] based DA client.
     /// Will finalize the job in an [JobStatus::Failed] state,
     /// that may be retryable.
