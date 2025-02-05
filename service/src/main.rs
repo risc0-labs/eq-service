@@ -46,7 +46,8 @@ async fn get_program_id() -> SuccNetProgramId {
     *KECCAK_INCLUSION_ID
         .get_or_init(|| async {
             debug!("Building Program ID");
-            Sha3_256::digest(KECCAK_INCLUSION_ELF).into() })
+            Sha3_256::digest(KECCAK_INCLUSION_ELF).into()
+        })
         .await
 }
 
@@ -95,13 +96,16 @@ impl std::fmt::Debug for Job {
 }
 
 /// Used as a [Job] state machine for the eq-service.
+///
+/// Should map 1to1 with [ResponseStatus] for consistancy in internal state
+/// and what is reported by the RPC.
 #[derive(Serialize, Deserialize)]
 enum JobStatus {
-    /// DA inclusion proof data is being awaited
+    /// DA inclusion proof data is being collected
     DataAvalibilityPending,
     /// DA inclusion is processed and ready to send to the ZK prover
     DataAvalibile(KeccakInclusionToDataRootProofInput),
-    /// A ZK prover job is ready to run
+    /// A ZK prover job had been requested, awaiting response
     ZkProofPending(SuccNetJobId),
     /// A ZK proof is ready, and the [Job] is complete
     // For now we'll use the SP1ProofWithPublicValues as the proof
@@ -109,8 +113,8 @@ enum JobStatus {
     // They don't seem to provide a type for that.
     ZkProofFinished(SP1ProofWithPublicValues),
     /// A wrapper for any [InclusionServiceError], with:
-    /// - Option = None               -> No retry is possilbe (Perminent failure)
-    /// - Option = Some(\<retry-able status\>) -> Retry is possilbe, with a JobStatus state to retry with
+    /// - Option = None                        --> Perminent failure
+    /// - Option = Some(\<retry-able status\>) --> Retry is possilbe, with a JobStatus state to retry with
     Failed(InclusionServiceError, Option<Box<JobStatus>>),
 }
 
@@ -184,27 +188,51 @@ impl Inclusion for InclusionServiceArc {
             match job_status {
                 JobStatus::ZkProofFinished(proof) => {
                     return Ok(Response::new(GetKeccakInclusionResponse {
-                        status: ResponseStatus::Complete as i32,
+                        status: ResponseStatus::ZkpFinished as i32,
                         response_value: Some(ResponseValue::Proof(
                             bincode::serialize(&proof)
                                 .map_err(|e| Status::internal(e.to_string()))?,
                         )),
                     }));
                 }
-                JobStatus::Failed(error, None) => {
-                    return Ok(Response::new(GetKeccakInclusionResponse {
-                        status: ResponseStatus::Failed as i32,
-                        response_value: Some(ResponseValue::ErrorMessage(format!("{error:?}"))),
-                    }));
-                }
-                JobStatus::Failed(error, retry_status) => {
-                    // TODO: retry or not?
-                    return Ok(Response::new(GetKeccakInclusionResponse {
-                        status: ResponseStatus::Waiting as i32,
-                        response_value: Some(ResponseValue::StatusMessage(format!(
-                            "Retryring: {retry_status:?} ||| Previous Error: {error:?}"
-                        ))),
-                    }));
+                JobStatus::Failed(error, maybe_status) => {
+                    match maybe_status {
+                        None => {
+                            return Ok(Response::new(GetKeccakInclusionResponse {
+                                status: ResponseStatus::PermanentFailure as i32,
+                                response_value: Some(ResponseValue::ErrorMessage(format!(
+                                    "{error:?}"
+                                ))),
+                            }));
+                        }
+                        Some(retry_status) => {
+                            // We retry errors on each call to the gRPC
+                            // for a specific [Job] by seding to the queue
+                            match self.0.send_job_with_new_status(
+                                &self.0.queue_db,
+                                job_key,
+                                *retry_status,
+                                job,
+                            ) {
+                                Ok(_) => {
+                                    return Ok(Response::new(GetKeccakInclusionResponse {
+                                        status: ResponseStatus::RetryableFailure as i32,
+                                        response_value: Some(ResponseValue::ErrorMessage(format!(
+                                            "Retryring! Previous error: {error:?}"
+                                        ))),
+                                    }));
+                                }
+                                Err(e) => {
+                                    return Ok(Response::new(GetKeccakInclusionResponse {
+                                        status: ResponseStatus::PermanentFailure as i32,
+                                        response_value: Some(ResponseValue::ErrorMessage(format!(
+                                            "Internal Failure: {e:?}"
+                                        ))),
+                                    }));
+                                }
+                            }
+                        }
+                    }
                 }
                 _ => {
                     let e = "Finished DB is in invalid state";
@@ -227,35 +255,34 @@ impl Inclusion for InclusionServiceArc {
             match job_status {
                 JobStatus::DataAvalibilityPending => {
                     return Ok(Response::new(GetKeccakInclusionResponse {
-                        status: ResponseStatus::Waiting as i32,
+                        status: ResponseStatus::DaPending as i32,
                         response_value: Some(ResponseValue::StatusMessage(
-                            "Gathering NMT Proof from Celestia".to_string(),
+                            "Trying to collect DA inclusion proof".to_string(),
                         )),
                     }));
                 }
                 JobStatus::DataAvalibile(_) => {
                     return Ok(Response::new(GetKeccakInclusionResponse {
-                        status: ResponseStatus::Waiting as i32,
+                        status: ResponseStatus::DaAvalible as i32,
                         response_value: Some(ResponseValue::StatusMessage(
-                            "Got NMT from Celestia, awating ZK proof".to_string(),
+                            "Valid DA inclusion proof, requesting ZKP".to_string(),
                         )),
                     }));
                 }
                 JobStatus::ZkProofPending(job_id) => {
                     return Ok(Response::new(GetKeccakInclusionResponse {
-                        status: ResponseStatus::InProgress as i32,
+                        status: ResponseStatus::ZkpPending as i32,
                         response_value: Some(ResponseValue::ProofId(job_id.to_vec())),
                     }));
                 }
                 _ => {
-                    let e = "Queue is in invalid state";
+                    let e = "Job queue is in invalid state for {job:?}";
                     error!("{e}");
                     return Err(Status::internal(e));
                 }
             }
         }
 
-        // No jobs in DB, create a new one
         info!("New {job:?} sending to worker and adding to queue");
         self.0
             .queue_db
@@ -271,11 +298,10 @@ impl Inclusion for InclusionServiceArc {
             .send(job.clone())
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        debug!("Returning waiting response");
         Ok(Response::new(GetKeccakInclusionResponse {
-            status: ResponseStatus::Waiting as i32,
+            status: ResponseStatus::DaPending as i32,
             response_value: Some(ResponseValue::StatusMessage(
-                "sent to proof worker".to_string(),
+                "New job started! Call again for status and results".to_string(),
             )),
         }))
     }
@@ -298,7 +324,6 @@ impl InclusionService {
                 let _ = service.prove(job).await; //Don't return with "?", we run keep looping
             });
         }
-        unreachable!("Worker loops on tasks")
     }
 
     /// The main service task: produce a proof based on a [Job] requested.
@@ -311,14 +336,17 @@ impl InclusionService {
                 match job_status {
                     JobStatus::DataAvalibilityPending => {
                         let da_client_handle = self.get_da_client().await.clone();
-                        self.get_zk_proof_input_from_da(&job, job_key, da_client_handle)
-                            .await?
+                        self.get_zk_proof_input_from_da(&job, &job_key, da_client_handle)
+                            .await?;
+                        debug!("DA data -> zk input ready");
                     }
                     JobStatus::DataAvalibile(proof_input) => {
                         // TODO handle non-hardcoded ZK programs
-                        match self.request_zk_proof(get_program_id().await, proof_input).await {
+                        match self
+                            .request_zk_proof(&get_program_id().await, &proof_input)
+                            .await
+                        {
                             Ok(zk_job_id) => {
-                                debug!("DA data -> zk input ready");
                                 job_status = JobStatus::ZkProofPending(zk_job_id);
                                 self.send_job_with_new_status(
                                     &self.queue_db,
@@ -329,13 +357,18 @@ impl InclusionService {
                             }
                             Err(e) => {
                                 error!("{job:?} failed progressing DataAvalibile: {e}");
-                                job_status = JobStatus::Failed(e, None);
+                                job_status = JobStatus::Failed(
+                                    e,
+                                    Some(JobStatus::DataAvalibile(proof_input).into()),
+                                );
                                 self.finalize_job(&job_key, job_status)?;
                             }
                         };
+                        debug!("ZK request sent");
                     }
-                    JobStatus::ZkProofPending(zk_job_id) => {
-                        match self.wait_for_zk_proof(zk_job_id).await {
+                    JobStatus::ZkProofPending(zk_request_id) => {
+                        debug!("ZK request waiting");
+                        match self.wait_for_zk_proof(&job_key, zk_request_id).await {
                             Ok(zk_proof) => {
                                 info!("🎉 {job:?} Finished!");
                                 job_status = JobStatus::ZkProofFinished(zk_proof);
@@ -343,16 +376,16 @@ impl InclusionService {
                             }
                             Err(e) => {
                                 error!("{job:?} failed progressing ZkProofPending: {e}");
-                                job_status = JobStatus::Failed(e, None);
+                                job_status = JobStatus::Failed(
+                                    e,
+                                    Some(JobStatus::ZkProofPending(zk_request_id).into()),
+                                );
                                 self.finalize_job(&job_key, job_status)?;
                             }
                         }
+                        debug!("ZK request fufilled");
                     }
-                    JobStatus::ZkProofFinished(_) => (),
-                    JobStatus::Failed(_, _) => {
-                        // TODO: "Need to impl some way to retry some failures, and report perminent failures here"
-                        ()
-                    }
+                    _ => error!("Queue has INVALID status! Finished jobs stuck in queue!"),
                 }
             },
         )
@@ -365,10 +398,10 @@ impl InclusionService {
     /// to read from for many concurrent [Job]s.
     async fn get_proof_setup(
         &self,
-        zk_program_elf_sha3: [u8; 32],
+        zk_program_elf_sha3: &[u8; 32],
         zk_client_handle: Arc<SP1NetworkProver>,
     ) -> Result<Arc<SP1ProofSetup>, InclusionServiceError> {
-        debug!("Getting prover setup");
+        debug!("Getting ZK program proof setup");
         let setup = KECCAK_INCLUSION_SETUP
             .get_or_try_init(|| async {
                 // Check DB for existing pre-computed setup
@@ -415,7 +448,7 @@ impl InclusionService {
     async fn get_zk_proof_input_from_da(
         &self,
         job: &Job,
-        job_key: Vec<u8>,
+        job_key: &Vec<u8>,
         client: Arc<CelestiaJSONClient>,
     ) -> Result<(), InclusionServiceError> {
         debug!("Preparing request to Celestia");
@@ -427,24 +460,18 @@ impl InclusionService {
         let header = client
             .header_get_by_height(job.height.into())
             .await
-            .map_err(|e| {
-                error!("Failed to get header proof from Celestia: {}", e);
-                InclusionServiceError::DaClientError(e.to_string())
-            })?;
+            .map_err(|e| self.handle_da_client_error(e, &job, &job_key))?;
 
         let nmt_multiproofs = client
             .blob_get_proof(job.height.into(), job.namespace, job.commitment)
             .await
-            .map_err(|e| {
-                error!("Failed to get blob proof from Celestia: {}", e);
-                InclusionServiceError::DaClientError(e.to_string())
-            })?;
+            .map_err(|e| self.handle_da_client_error(e, &job, &job_key))?;
 
         debug!("Creating ZK Proof input from Celestia Data");
         if let Ok(proof_input) = create_inclusion_proof_input(&blob, &header, nmt_multiproofs) {
             self.send_job_with_new_status(
                 &self.queue_db,
-                job_key,
+                job_key.to_vec(),
                 JobStatus::DataAvalibile(proof_input),
                 job.clone(),
             )?;
@@ -453,13 +480,13 @@ impl InclusionService {
 
         error!("Failed to get proof from Celestia - This should be unrechable!");
         Err(InclusionServiceError::DaClientError(format!(
-            "Could not obtain NMT proof of data inclusion"
+            "Could not obtain NMT proof of data inclusion. PLEASE REPORT!"
         )))
     }
 
     /// Helper function to handle error from a [jsonrpsee] based DA client.
-    /// If we can handle the client error, we wrap Ok() it
-    /// If there is another issues (like writting to the DB) we Err
+    /// Will finalize the job in an [JobStatus::Failed] state,
+    /// that may be retryable.
     fn handle_da_client_error(
         &self,
         da_client_error: JsonRpcError,
@@ -471,27 +498,41 @@ impl InclusionService {
         match da_client_error {
             JsonRpcError::Call(error_object) => {
                 // TODO: make this handle errors much better! JSON stringyness is a problem!
-                if error_object.message() == "header: not found" {
-                    e = InclusionServiceError::DaClientError("header: not found. Likely Celestia Node is missing blob, although it exists on the network overall.".to_string());
-                    error!("{job:?} failed, recoverable: {e}");
+                if error_object.message().starts_with("header: not found") {
+                    e = InclusionServiceError::DaClientError("header: not found. Likely DA Node is not properly synced, and blob does exists on the network. PLEASE REPORT!".to_string());
                     job_status = JobStatus::Failed(
                         e.clone(),
                         Some(JobStatus::DataAvalibilityPending.into()),
                     );
-                } else if error_object.message() == "blob: not found" {
-                    e = InclusionServiceError::DaClientError("blob: not found".to_string());
-                    error!("{job:?} failed, not recoverable: {e}");
+                } else if error_object
+                    .message()
+                    .starts_with("header: given height is from the future")
+                {
+                    e = InclusionServiceError::DaClientError(
+                        "header: given height is from the future".to_string(),
+                    );
+                    job_status = JobStatus::Failed(e.clone(), None);
+                } else if error_object.message().starts_with("blob: not found") {
+                    e = InclusionServiceError::DaClientError(
+                        "blob: not found. Likely incorrect request inputs.".to_string(),
+                    );
                     job_status = JobStatus::Failed(e.clone(), None);
                 } else {
-                    e = InclusionServiceError::DaClientError("UNKNOWN client error".to_string());
-                    error!("{job:?} failed, not recoverable: {e}");
+                    e = InclusionServiceError::DaClientError(
+                        "UNKNOWN DA client error. PLEASE REPORT!".to_string(),
+                    );
                     job_status = JobStatus::Failed(e.clone(), None);
                 }
+            }
+            JsonRpcError::RequestTimeout => {
+                e = InclusionServiceError::DaClientError("DA Node RequestTimeout".to_string());
+                job_status =
+                    JobStatus::Failed(e.clone(), Some(JobStatus::DataAvalibilityPending.into()));
             }
             // TODO: handle other Celestia JSON RPC errors
             _ => {
                 e = InclusionServiceError::DaClientError(
-                    "Unhandled Celestia SDK error".to_string(),
+                    "Unhandled Celestia SDK error. PLEASE REPORT!".to_string(),
                 );
                 error!("{job:?} failed, not recoverable: {e}");
                 job_status = JobStatus::Failed(e.clone(), None);
@@ -506,8 +547,8 @@ impl InclusionService {
     /// Start a proof request from Succinct's prover network
     async fn request_zk_proof(
         &self,
-        program_id: SuccNetProgramId,
-        proof_input: KeccakInclusionToDataRootProofInput,
+        program_id: &SuccNetProgramId,
+        proof_input: &KeccakInclusionToDataRootProofInput,
     ) -> Result<SuccNetJobId, InclusionServiceError> {
         debug!("Preparing prover network request and starting proving");
         let zk_client_handle = self.get_zk_client_remote().await;
@@ -520,8 +561,14 @@ impl InclusionService {
         let request_id: SuccNetJobId = zk_client_handle
             .prove(&proof_setup.pk, &stdin)
             .groth16()
+            // NOTE: this assumes all programs & setups are tested before use in this service!!
+            // It reduces time for all subsiquent requests using the client
+            // It assumes [DEFAULT_CYCLE_LIMIT](https://github.com/succinctlabs/sp1/blob/cfc62312a1a36f0517e63ea9e7f279490f5a87aa/crates/sdk/src/network/mod.rs#L26) among perhaps other things?
+            // See https://docs.succinct.xyz/docs/generating-proofs/prover-network/usage
+            .skip_simulation(true)
             .request_async()
             .await
+            // TODO: how to handle errors without a concrete type? Anyhow is not the right thing for us...
             .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))?
             .into();
 
@@ -531,15 +578,32 @@ impl InclusionService {
     /// Await a proof request from Succinct's prover network
     async fn wait_for_zk_proof(
         &self,
+        job_key: &Vec<u8>,
         request_id: SuccNetJobId,
     ) -> Result<SP1ProofWithPublicValues, InclusionServiceError> {
         debug!("Waiting for proof from prover network");
         let zk_client_handle = self.get_zk_client_remote().await;
 
-        zk_client_handle
+        let proof = zk_client_handle
             .wait_proof(request_id.into(), None)
             .await
-            .map_err(|e| InclusionServiceError::GeneralError(e.to_string()))
+            .map_err(|e| {
+                error!("UNHANDLED ZK client error: {e:?}");
+                let e = InclusionServiceError::ZkClientError(
+                    "UNKNOWN ZK client error. PLEASE REPORT!".to_string(),
+                );
+                match self.finalize_job(
+                    job_key,
+                    JobStatus::Failed(
+                        e.clone(),
+                        Some(JobStatus::ZkProofPending(request_id).into()),
+                    ),
+                ) {
+                    Ok(_) => return e,
+                    Err(internal_err) => return internal_err,
+                };
+            })?;
+        Ok(proof)
     }
 
     /// Atomically move a job from the database queue tree to the proof tree.
@@ -608,7 +672,7 @@ impl InclusionService {
         let handle = self
             .zk_client_handle
             .get_or_init(|| async {
-                debug!("Building prover client");
+                debug!("Building ZK client");
                 let client = sp1_sdk::ProverClient::builder().network().build();
                 Arc::new(client)
             })
@@ -659,7 +723,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let program_id = get_program_id().await;
             let zk_client = service.clone().get_zk_client_remote().await;
             debug!("ZK client prepared, aquiring setup");
-            let _ = service.get_proof_setup(program_id, zk_client).await;
+            let _ = service.get_proof_setup(&program_id, zk_client).await;
             info!("ZK client ready!");
         }
         // TODO: crash whole program if this fails
@@ -713,4 +777,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
