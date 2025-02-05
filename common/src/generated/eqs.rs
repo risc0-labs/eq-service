@@ -2,15 +2,15 @@
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetKeccakInclusionRequest {
-    /// 32 byte blob commitment
-    #[prost(bytes = "vec", tag = "1")]
-    pub commitment: ::prost::alloc::vec::Vec<u8>,
-    /// 32 byte namespace
+    /// Data Avaliblity block height
+    #[prost(uint64, tag = "1")]
+    pub height: u64,
+    /// 32 byte DA namespace
     #[prost(bytes = "vec", tag = "2")]
     pub namespace: ::prost::alloc::vec::Vec<u8>,
-    /// block height
-    #[prost(uint64, tag = "3")]
-    pub height: u64,
+    /// 32 byte DA blob commitment
+    #[prost(bytes = "vec", tag = "3")]
+    pub commitment: ::prost::alloc::vec::Vec<u8>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -37,10 +37,18 @@ pub mod get_keccak_inclusion_response {
     )]
     #[repr(i32)]
     pub enum Status {
-        Waiting = 0,
-        InProgress = 1,
-        Complete = 2,
-        Failed = 3,
+        /// Data Avaliblity (DA) inclusion proof being collected
+        DaPending = 0,
+        /// DA inclusion proof collected
+        DaAvalible = 1,
+        /// Zero Knowledge Proof (ZKP) of DA inclusion requested, generating
+        ZkpPending = 2,
+        /// ZKP of DA inclusion proof finished
+        ZkpFinished = 3,
+        /// If this is returned, the service then attempts to retry
+        RetryableFailure = 4,
+        /// No way to complete request
+        PermanentFailure = 5,
     }
     impl Status {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -49,19 +57,23 @@ pub mod get_keccak_inclusion_response {
         /// (if the ProtoBuf definition does not change) and safe for programmatic use.
         pub fn as_str_name(&self) -> &'static str {
             match self {
-                Status::Waiting => "WAITING",
-                Status::InProgress => "IN_PROGRESS",
-                Status::Complete => "COMPLETE",
-                Status::Failed => "FAILED",
+                Status::DaPending => "DA_PENDING",
+                Status::DaAvalible => "DA_AVALIBLE",
+                Status::ZkpPending => "ZKP_PENDING",
+                Status::ZkpFinished => "ZKP_FINISHED",
+                Status::RetryableFailure => "RETRYABLE_FAILURE",
+                Status::PermanentFailure => "PERMANENT_FAILURE",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
         pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
             match value {
-                "WAITING" => Some(Self::Waiting),
-                "IN_PROGRESS" => Some(Self::InProgress),
-                "COMPLETE" => Some(Self::Complete),
-                "FAILED" => Some(Self::Failed),
+                "DA_PENDING" => Some(Self::DaPending),
+                "DA_AVALIBLE" => Some(Self::DaAvalible),
+                "ZKP_PENDING" => Some(Self::ZkpPending),
+                "ZKP_FINISHED" => Some(Self::ZkpFinished),
+                "RETRYABLE_FAILURE" => Some(Self::RetryableFailure),
+                "PERMANENT_FAILURE" => Some(Self::PermanentFailure),
                 _ => None,
             }
         }
@@ -69,16 +81,16 @@ pub mod get_keccak_inclusion_response {
     #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum ResponseValue {
-        /// Used when status is IN_PROGRESS, this is the proof id of the prover network
+        /// When ZKP_PENDING, this is the proof request/job id on the prover network
         #[prost(bytes, tag = "2")]
         ProofId(::prost::alloc::vec::Vec<u8>),
-        /// Used when status is COMPLETE
+        /// When ZKP_FINISHED, this is the proof data
         #[prost(bytes, tag = "3")]
         Proof(::prost::alloc::vec::Vec<u8>),
-        /// Used when status is FAILED
+        /// Used when status is FAILED, this includes details why
         #[prost(string, tag = "4")]
         ErrorMessage(::prost::alloc::string::String),
-        /// Used when status is WAITING, this is the status message of the prover network
+        /// Additional details on status of a request
         #[prost(string, tag = "5")]
         StatusMessage(::prost::alloc::string::String),
     }

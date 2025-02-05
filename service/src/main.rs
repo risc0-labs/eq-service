@@ -1,7 +1,6 @@
 #![doc = include_str!("../../README.md")]
 
 use jsonrpsee::core::ClientError as JsonRpcError;
-use sp1_sdk::network::proto::network::FulfillmentStatus as SuccNetFulfillmentStatus;
 use std::sync::Arc;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -97,13 +96,16 @@ impl std::fmt::Debug for Job {
 }
 
 /// Used as a [Job] state machine for the eq-service.
+///
+/// Should map 1to1 with [ResponseStatus] for consistancy in internal state
+/// and what is reported by the RPC.
 #[derive(Serialize, Deserialize)]
 enum JobStatus {
-    /// DA inclusion proof data is being awaited
+    /// DA inclusion proof data is being collected
     DataAvalibilityPending,
     /// DA inclusion is processed and ready to send to the ZK prover
     DataAvalibile(KeccakInclusionToDataRootProofInput),
-    /// A ZK prover job is ready to run
+    /// A ZK prover job had been requested, awaiting response
     ZkProofPending(SuccNetJobId),
     /// A ZK proof is ready, and the [Job] is complete
     // For now we'll use the SP1ProofWithPublicValues as the proof
@@ -111,8 +113,8 @@ enum JobStatus {
     // They don't seem to provide a type for that.
     ZkProofFinished(SP1ProofWithPublicValues),
     /// A wrapper for any [InclusionServiceError], with:
-    /// - Option = None               -> No retry is possilbe (Perminent failure)
-    /// - Option = Some(\<retry-able status\>) -> Retry is possilbe, with a JobStatus state to retry with
+    /// - Option = None                        --> Perminent failure
+    /// - Option = Some(\<retry-able status\>) --> Retry is possilbe, with a JobStatus state to retry with
     Failed(InclusionServiceError, Option<Box<JobStatus>>),
 }
 
@@ -186,42 +188,49 @@ impl Inclusion for InclusionServiceArc {
             match job_status {
                 JobStatus::ZkProofFinished(proof) => {
                     return Ok(Response::new(GetKeccakInclusionResponse {
-                        status: ResponseStatus::Complete as i32,
+                        status: ResponseStatus::ZkpFinished as i32,
                         response_value: Some(ResponseValue::Proof(
                             bincode::serialize(&proof)
                                 .map_err(|e| Status::internal(e.to_string()))?,
                         )),
                     }));
                 }
-                JobStatus::Failed(error, None) => {
-                    return Ok(Response::new(GetKeccakInclusionResponse {
-                        status: ResponseStatus::Failed as i32,
-                        response_value: Some(ResponseValue::ErrorMessage(format!("{error:?}"))),
-                    }));
-                }
-                JobStatus::Failed(error, retry_status) => {
-                    // We retry errors on each call to the gRPC
-                    match self.0.send_job_with_new_status(
-                        &self.0.queue_db,
-                        job_key,
-                        *retry_status.expect("always able to read DB status"),
-                        job,
-                    ) {
-                        Ok(_) => {
+                JobStatus::Failed(error, maybe_status) => {
+                    match maybe_status {
+                        None => {
                             return Ok(Response::new(GetKeccakInclusionResponse {
-                                status: ResponseStatus::Waiting as i32,
-                                response_value: Some(ResponseValue::StatusMessage(format!(
-                                    "Retryring! Previous Error: {error:?}"
+                                status: ResponseStatus::PermanentFailure as i32,
+                                response_value: Some(ResponseValue::ErrorMessage(format!(
+                                    "{error:?}"
                                 ))),
                             }));
                         }
-                        Err(e) => {
-                            return Ok(Response::new(GetKeccakInclusionResponse {
-                                status: ResponseStatus::Failed as i32,
-                                response_value: Some(ResponseValue::ErrorMessage(format!(
-                                    "Irrecoverable Error: {e:?}"
-                                ))),
-                            }));
+                        Some(retry_status) => {
+                            // We retry errors on each call to the gRPC
+                            // for a specific [Job] by seding to the queue
+                            match self.0.send_job_with_new_status(
+                                &self.0.queue_db,
+                                job_key,
+                                *retry_status,
+                                job,
+                            ) {
+                                Ok(_) => {
+                                    return Ok(Response::new(GetKeccakInclusionResponse {
+                                        status: ResponseStatus::RetryableFailure as i32,
+                                        response_value: Some(ResponseValue::ErrorMessage(format!(
+                                            "Retryring! Previous error: {error:?}"
+                                        ))),
+                                    }));
+                                }
+                                Err(e) => {
+                                    return Ok(Response::new(GetKeccakInclusionResponse {
+                                        status: ResponseStatus::PermanentFailure as i32,
+                                        response_value: Some(ResponseValue::ErrorMessage(format!(
+                                            "Internal Failure: {e:?}"
+                                        ))),
+                                    }));
+                                }
+                            }
                         }
                     }
                 }
@@ -246,35 +255,34 @@ impl Inclusion for InclusionServiceArc {
             match job_status {
                 JobStatus::DataAvalibilityPending => {
                     return Ok(Response::new(GetKeccakInclusionResponse {
-                        status: ResponseStatus::Waiting as i32,
+                        status: ResponseStatus::DaPending as i32,
                         response_value: Some(ResponseValue::StatusMessage(
-                            "Gathering NMT Proof from Celestia".to_string(),
+                            "Trying to collect DA inclusion proof".to_string(),
                         )),
                     }));
                 }
                 JobStatus::DataAvalibile(_) => {
                     return Ok(Response::new(GetKeccakInclusionResponse {
-                        status: ResponseStatus::Waiting as i32,
+                        status: ResponseStatus::DaAvalible as i32,
                         response_value: Some(ResponseValue::StatusMessage(
-                            "Got NMT from Celestia, awating ZK proof".to_string(),
+                            "Valid DA inclusion proof, requesting ZKP".to_string(),
                         )),
                     }));
                 }
                 JobStatus::ZkProofPending(job_id) => {
                     return Ok(Response::new(GetKeccakInclusionResponse {
-                        status: ResponseStatus::InProgress as i32,
+                        status: ResponseStatus::ZkpPending as i32,
                         response_value: Some(ResponseValue::ProofId(job_id.to_vec())),
                     }));
                 }
                 _ => {
-                    let e = "Queue is in invalid state";
+                    let e = "Job queue is in invalid state for {job:?}";
                     error!("{e}");
                     return Err(Status::internal(e));
                 }
             }
         }
 
-        // No jobs in DB, create a new one
         info!("New {job:?} sending to worker and adding to queue");
         self.0
             .queue_db
@@ -290,11 +298,10 @@ impl Inclusion for InclusionServiceArc {
             .send(job.clone())
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        debug!("Returning waiting response");
         Ok(Response::new(GetKeccakInclusionResponse {
-            status: ResponseStatus::Waiting as i32,
+            status: ResponseStatus::DaPending as i32,
             response_value: Some(ResponseValue::StatusMessage(
-                "sent to proof worker".to_string(),
+                "New job started! Call again for status and results".to_string(),
             )),
         }))
     }
@@ -330,7 +337,8 @@ impl InclusionService {
                     JobStatus::DataAvalibilityPending => {
                         let da_client_handle = self.get_da_client().await.clone();
                         self.get_zk_proof_input_from_da(&job, &job_key, da_client_handle)
-                            .await?
+                            .await?;
+                        debug!("DA data -> zk input ready");
                     }
                     JobStatus::DataAvalibile(proof_input) => {
                         // TODO handle non-hardcoded ZK programs
@@ -339,7 +347,6 @@ impl InclusionService {
                             .await
                         {
                             Ok(zk_job_id) => {
-                                debug!("DA data -> zk input ready");
                                 job_status = JobStatus::ZkProofPending(zk_job_id);
                                 self.send_job_with_new_status(
                                     &self.queue_db,
@@ -354,8 +361,10 @@ impl InclusionService {
                                 self.finalize_job(&job_key, job_status)?;
                             }
                         };
+                        debug!("ZK request sent");
                     }
                     JobStatus::ZkProofPending(zk_request_id) => {
+                        debug!("ZK request waiting");
                         match self.wait_for_zk_proof(&job_key, zk_request_id).await {
                             Ok(zk_proof) => {
                                 info!("🎉 {job:?} Finished!");
@@ -368,12 +377,9 @@ impl InclusionService {
                                 self.finalize_job(&job_key, job_status)?;
                             }
                         }
+                        debug!("ZK request fufilled");
                     }
-                    JobStatus::ZkProofFinished(_) => (),
-                    JobStatus::Failed(_, _) => {
-                        // TODO: "Need to impl some way to retry some failures, and report perminent failures here"
-                        ()
-                    }
+                    _ => error!("Queue has INVALID status! Finished jobs stuck in queue!"),
                 }
             },
         )
@@ -487,7 +493,7 @@ impl InclusionService {
             JsonRpcError::Call(error_object) => {
                 // TODO: make this handle errors much better! JSON stringyness is a problem!
                 if error_object.message().starts_with("header: not found") {
-                    e = InclusionServiceError::DaClientError("header: not found. Likely DA Node is not properly synced, and blob does exists on the network. PLEASE REPORT! Retryable.".to_string());
+                    e = InclusionServiceError::DaClientError("header: not found. Likely DA Node is not properly synced, and blob does exists on the network. PLEASE REPORT!".to_string());
                     job_status = JobStatus::Failed(
                         e.clone(),
                         Some(JobStatus::DataAvalibilityPending.into()),
@@ -497,12 +503,12 @@ impl InclusionService {
                     .starts_with("header: given height is from the future")
                 {
                     e = InclusionServiceError::DaClientError(
-                        "header: given height is from the future. Retryable.".to_string(),
+                        "header: given height is from the future".to_string(),
                     );
                     job_status = JobStatus::Failed(e.clone(), None);
                 } else if error_object.message().starts_with("blob: not found") {
                     e = InclusionServiceError::DaClientError(
-                        "blob: not found. Not retryable.".to_string(),
+                        "blob: not found. Likely incorrect request inputs.".to_string(),
                     );
                     job_status = JobStatus::Failed(e.clone(), None);
                 } else {
@@ -578,7 +584,7 @@ impl InclusionService {
             .map_err(|e| {
                 error!("UNHANDLED ZK client error: {e:?}");
                 let e = InclusionServiceError::ZkClientError(
-                    "UNKNOWN ZK client error. PLEASE REPORT! Retryable.".to_string(),
+                    "UNKNOWN ZK client error. PLEASE REPORT!".to_string(),
                 );
                 match self.finalize_job(
                     job_key,
