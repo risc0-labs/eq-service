@@ -357,7 +357,10 @@ impl InclusionService {
                             }
                             Err(e) => {
                                 error!("{job:?} failed progressing DataAvalibile: {e}");
-                                job_status = JobStatus::Failed(e, None);
+                                job_status = JobStatus::Failed(
+                                    e,
+                                    Some(JobStatus::DataAvalibile(proof_input)),
+                                );
                                 self.finalize_job(&job_key, job_status)?;
                             }
                         };
@@ -373,7 +376,10 @@ impl InclusionService {
                             }
                             Err(e) => {
                                 error!("{job:?} failed progressing ZkProofPending: {e}");
-                                job_status = JobStatus::Failed(e, None);
+                                job_status = JobStatus::Failed(
+                                    e,
+                                    Some(JobStatus::ZkProofPending(zk_request_id)),
+                                );
                                 self.finalize_job(&job_key, job_status)?;
                             }
                         }
