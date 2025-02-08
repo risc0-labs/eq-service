@@ -44,7 +44,7 @@ pub struct InclusionService {
     pub config_db: SledTree,
     pub queue_db: SledTree,
     pub finished_db: SledTree,
-    pub job_sender: mpsc::UnboundedSender<Job>,
+    pub job_sender: mpsc::UnboundedSender<Option<Job>>,
 }
 
 impl InclusionService {
@@ -55,7 +55,7 @@ impl InclusionService {
         config_db: SledTree,
         queue_db: SledTree,
         finished_db: SledTree,
-        job_sender: mpsc::UnboundedSender<Job>,
+        job_sender: mpsc::UnboundedSender<Option<Job>>,
     ) -> Self {
         InclusionService {
             config,
@@ -84,75 +84,84 @@ impl InclusionService {
     ///
     /// When a successful or failed state is arrived at,
     /// the job is atomically removed from the queue and added to a results database.
-    pub async fn job_worker(self: Arc<Self>, mut job_receiver: mpsc::UnboundedReceiver<Job>) {
+    pub async fn job_worker(
+        self: Arc<Self>,
+        mut job_receiver: mpsc::UnboundedReceiver<Option<Job>>,
+    ) {
         debug!("Job worker started");
-        while let Some(job) = job_receiver.recv().await {
+        while let Some(Some(job)) = job_receiver.recv().await {
             let service = self.clone();
             tokio::spawn(async move {
                 debug!("Job worker received {job:?}",);
                 let _ = service.prove(job).await; //Don't return with "?", we run keep looping
             });
         }
+
+        info!("Shutting down");
+        let _ = self.queue_db.flush();
+        let _ = self.finished_db.flush();
+        info!("Cleanup complete");
+
+        std::process::exit(0);
     }
 
     /// The main service task: produce a proof based on a [Job] requested.
     pub async fn prove(&self, job: Job) -> Result<(), InclusionServiceError> {
         let job_key = bincode::serialize(&job).unwrap();
-        Ok(
-            if let Some(queue_data) = self.queue_db.get(&job_key).unwrap() {
-                let mut job_status: JobStatus = bincode::deserialize(&queue_data).unwrap();
-                debug!("Job worker processing with starting status: {job_status:?}");
-                match job_status {
-                    JobStatus::DataAvailabilityPending => {
-                        let da_client_handle = self.get_da_client().await.clone();
-                        self.get_zk_proof_input_from_da(&job, &job_key, da_client_handle?)
-                            .await?;
-                        debug!("DA data -> zk input ready");
-                    }
-                    JobStatus::DataAvailable(proof_input) => {
-                        // TODO handle non-hardcoded ZK programs
-                        match self
-                            .request_zk_proof(&get_program_id().await, &proof_input, &job, &job_key)
-                            .await
-                        {
-                            Ok(zk_job_id) => {
-                                job_status = JobStatus::ZkProofPending(zk_job_id);
-                                self.send_job_with_new_status(job_key, job_status, job)?;
-                            }
-                            Err(e) => {
-                                error!("{job:?} failed progressing DataAvailable: {e}");
-                                job_status = JobStatus::Failed(
-                                    e,
-                                    Some(JobStatus::DataAvailable(proof_input).into()),
-                                );
-                                self.finalize_job(&job_key, job_status)?;
-                            }
-                        };
-                        debug!("ZK request sent");
-                    }
-                    JobStatus::ZkProofPending(zk_request_id) => {
-                        debug!("ZK request waiting");
-                        match self.wait_for_zk_proof(&job_key, zk_request_id).await {
-                            Ok(zk_proof) => {
-                                info!("🎉 {job:?} Finished!");
-                                job_status = JobStatus::ZkProofFinished(zk_proof);
-                                self.finalize_job(&job_key, job_status)?;
-                            }
-                            Err(e) => {
-                                error!("{job:?} failed progressing ZkProofPending: {e}");
-                                job_status = JobStatus::Failed(
-                                    e,
-                                    Some(JobStatus::ZkProofPending(zk_request_id).into()),
-                                );
-                                self.finalize_job(&job_key, job_status)?;
-                            }
-                        }
-                        debug!("ZK request fulfilled");
-                    }
-                    _ => error!("Queue has INVALID status! Finished jobs stuck in queue!"),
+        if let Some(queue_data) = self.queue_db.get(&job_key).unwrap() {
+            let mut job_status: JobStatus = bincode::deserialize(&queue_data).unwrap();
+            debug!("Job worker processing with starting status: {job_status:?}");
+            match job_status {
+                JobStatus::DataAvailabilityPending => {
+                    let da_client_handle = self.get_da_client().await.clone();
+                    self.get_zk_proof_input_from_da(&job, &job_key, da_client_handle?)
+                        .await?;
+                    debug!("DA data -> zk input ready");
                 }
-            },
-        )
+                JobStatus::DataAvailable(proof_input) => {
+                    // TODO handle non-hardcoded ZK programs
+                    match self
+                        .request_zk_proof(&get_program_id().await, &proof_input, &job, &job_key)
+                        .await
+                    {
+                        Ok(zk_job_id) => {
+                            job_status = JobStatus::ZkProofPending(zk_job_id);
+                            self.send_job_with_new_status(job_key, job_status, job)?;
+                        }
+                        Err(e) => {
+                            error!("{job:?} failed progressing DataAvailable: {e}");
+                            job_status = JobStatus::Failed(
+                                e,
+                                Some(JobStatus::DataAvailable(proof_input).into()),
+                            );
+                            self.finalize_job(&job_key, job_status)?;
+                        }
+                    };
+                    debug!("ZK request sent");
+                }
+                JobStatus::ZkProofPending(zk_request_id) => {
+                    debug!("ZK request waiting");
+                    match self.wait_for_zk_proof(&job_key, zk_request_id).await {
+                        Ok(zk_proof) => {
+                            info!("🎉 {job:?} Finished!");
+                            job_status = JobStatus::ZkProofFinished(zk_proof);
+                            self.finalize_job(&job_key, job_status)?;
+                        }
+                        Err(e) => {
+                            error!("{job:?} failed progressing ZkProofPending: {e}");
+                            job_status = JobStatus::Failed(
+                                e,
+                                Some(JobStatus::ZkProofPending(zk_request_id).into()),
+                            );
+                            self.finalize_job(&job_key, job_status)?;
+                        }
+                    }
+                    debug!("ZK request fulfilled");
+                }
+                _ => error!("Queue has INVALID status! Finished jobs stuck in queue!"),
+            }
+        };
+        Ok(())
     }
 
     /// Given a SHA3 hash of a ZK program, get the require setup.
@@ -191,7 +200,7 @@ impl InclusionService {
 
                     self.config_db
                         .insert(
-                            &zk_program_elf_sha3,
+                            zk_program_elf_sha3,
                             bincode::serialize(&new_proof_setup)
                                 .map_err(|e| InclusionServiceError::InternalError(e.to_string()))?,
                         )
@@ -212,24 +221,24 @@ impl InclusionService {
     async fn get_zk_proof_input_from_da(
         &self,
         job: &Job,
-        job_key: &Vec<u8>,
+        job_key: &[u8],
         client: Arc<CelestiaJSONClient>,
     ) -> Result<(), InclusionServiceError> {
         debug!("Preparing request to Celestia");
         let blob = client
             .blob_get(job.height.into(), job.namespace, job.commitment)
             .await
-            .map_err(|e| self.handle_da_client_error(e, &job, &job_key))?;
+            .map_err(|e| self.handle_da_client_error(e, job, job_key))?;
 
         let header = client
             .header_get_by_height(job.height.into())
             .await
-            .map_err(|e| self.handle_da_client_error(e, &job, &job_key))?;
+            .map_err(|e| self.handle_da_client_error(e, job, job_key))?;
 
         let nmt_multiproofs = client
             .blob_get_proof(job.height.into(), job.namespace, job.commitment)
             .await
-            .map_err(|e| self.handle_da_client_error(e, &job, &job_key))?;
+            .map_err(|e| self.handle_da_client_error(e, job, job_key))?;
 
         debug!("Creating ZK Proof input from Celestia Data");
         if let Ok(proof_input) = create_inclusion_proof_input(&blob, &header, nmt_multiproofs) {
@@ -242,9 +251,9 @@ impl InclusionService {
         }
 
         error!("Failed to get proof from Celestia - This should be unreachable!");
-        Err(InclusionServiceError::DaClientError(format!(
-            "Could not obtain NMT proof of data inclusion. PLEASE REPORT!"
-        )))
+        Err(InclusionServiceError::DaClientError(
+            "Could not obtain NMT proof of data inclusion. PLEASE REPORT!".to_string(),
+        ))
     }
 
     /// Helper function to handle error from a [jsonrpsee] based DA client.
@@ -254,7 +263,7 @@ impl InclusionService {
         &self,
         da_client_error: JsonRpcError,
         job: &Job,
-        job_key: &Vec<u8>,
+        job_key: &[u8],
     ) -> InclusionServiceError {
         error!("Celestia Client error: {da_client_error}");
         let (e, job_status);
@@ -314,9 +323,9 @@ impl InclusionService {
             }
         };
         match self.finalize_job(job_key, job_status) {
-            Ok(_) => return e,
-            Err(internal_err) => return internal_err,
-        };
+            Ok(_) => e,
+            Err(internal_err) => internal_err,
+        }
     }
 
     /// Helper function to handle error from a SP1 NetworkProver Clents.
@@ -326,7 +335,7 @@ impl InclusionService {
         &self,
         zk_client_error: &SP1NetworkError,
         job: &Job,
-        job_key: &Vec<u8>,
+        job_key: &[u8],
     ) -> InclusionServiceError {
         error!("SP1 Client error: {zk_client_error}");
         let (e, job_status);
@@ -366,9 +375,9 @@ impl InclusionService {
             }
         }
         match self.finalize_job(job_key, job_status) {
-            Ok(_) => return e,
-            Err(internal_err) => return internal_err,
-        };
+            Ok(_) => e,
+            Err(internal_err) => internal_err,
+        }
     }
 
     /// Start a proof request from Succinct's prover network
@@ -377,7 +386,7 @@ impl InclusionService {
         program_id: &SuccNetProgramId,
         proof_input: &KeccakInclusionToDataRootProofInput,
         job: &Job,
-        job_key: &Vec<u8>,
+        job_key: &[u8],
     ) -> Result<SuccNetJobId, InclusionServiceError> {
         debug!("Preparing prover network request and starting proving");
         let zk_client_handle = self.get_zk_client_remote().await;
@@ -408,7 +417,7 @@ impl InclusionService {
     /// Await a proof request from Succinct's prover network
     async fn wait_for_zk_proof(
         &self,
-        job_key: &Vec<u8>,
+        job_key: &[u8],
         request_id: SuccNetJobId,
     ) -> Result<SP1ProofWithPublicValues, InclusionServiceError> {
         debug!("Waiting for proof from prover network");
@@ -429,9 +438,9 @@ impl InclusionService {
                         Some(JobStatus::ZkProofPending(request_id).into()),
                     ),
                 ) {
-                    Ok(_) => return e,
-                    Err(internal_err) => return internal_err,
-                };
+                    Ok(_) => e,
+                    Err(internal_err) => internal_err,
+                }
             })?;
         Ok(proof)
     }
@@ -442,15 +451,15 @@ impl InclusionService {
     /// (but this is not enforced or checked at this time)
     fn finalize_job(
         &self,
-        job_key: &Vec<u8>,
+        job_key: &[u8],
         job_status: JobStatus,
     ) -> Result<(), InclusionServiceError> {
         // TODO: do we want to do a status check here? To prevent accidentally getting into a DB invalid state
         (&self.queue_db, &self.finished_db)
             .transaction(|(queue_tx, finished_tx)| {
-                queue_tx.remove(job_key.clone())?;
+                queue_tx.remove(job_key)?;
                 finished_tx.insert(
-                    job_key.clone(),
+                    job_key,
                     bincode::serialize(&job_status).expect("Always given serializable job status"),
                 )?;
                 Ok::<(), sled::transaction::ConflictableTransactionError<InclusionServiceError>>(())
@@ -480,10 +489,9 @@ impl InclusionService {
                 Ok::<(), sled::transaction::ConflictableTransactionError<InclusionServiceError>>(())
             })
             .map_err(|e| InclusionServiceError::InternalError(e.to_string()))?;
-        Ok(self
-            .job_sender
-            .send(job)
-            .map_err(|e| InclusionServiceError::InternalError(e.to_string()))?)
+        self.job_sender
+            .send(Some(job))
+            .map_err(|e| InclusionServiceError::InternalError(e.to_string()))
     }
 
     pub async fn get_da_client(&self) -> Result<Arc<CelestiaJSONClient>, InclusionServiceError> {
@@ -505,15 +513,18 @@ impl InclusionService {
     }
 
     pub async fn get_zk_client_remote(&self) -> Arc<SP1NetworkProver> {
-        let handle = self
-            .zk_client_handle
+        self.zk_client_handle
             .get_or_init(|| async {
                 debug!("Building ZK client");
                 let client = sp1_sdk::ProverClient::builder().network().build();
                 Arc::new(client)
             })
             .await
-            .clone();
-        handle
+            .clone()
+    }
+
+    pub fn shutdown(&self) {
+        info!("Terminating worker,finishing prexisting jobs");
+        let _ = self.job_sender.send(None); // Break loop in `job_worker`
     }
 }
