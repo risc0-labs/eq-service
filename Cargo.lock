@@ -1950,6 +1950,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eq-sdk"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "celestia-types",
+ "eq-common",
+ "log",
+ "serde",
+ "tokio",
+ "tonic 0.11.0",
+]
+
+[[package]]
 name = "eq_service"
 version = "0.1.0"
 dependencies = [
@@ -1959,6 +1972,7 @@ dependencies = [
  "celestia-types",
  "env_logger",
  "eq-common",
+ "eq-sdk",
  "hex",
  "jsonrpsee",
  "log",
@@ -1969,10 +1983,6 @@ dependencies = [
  "tokio",
  "tonic 0.11.0",
 ]
-
-[[package]]
-name = "eqs-client"
-version = "0.1.0"
 
 [[package]]
 name = "equivalent"
