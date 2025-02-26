@@ -4,8 +4,8 @@ default-members = ["service"]
 resolver = "2"
 
 [workspace.dependencies]
-celestia-types = {git="https://github.com/eigerco/lumina.git"}
-celestia-rpc = {git="https://github.com/eigerco/lumina.git"}
+celestia-types = "0.10"
+celestia-rpc = "0.9"
 nmt-rs = "0.2"
 sp1-zkvm = {version="4.0", features=["verify"]}
 sp1-sdk = {version="4.0"}
