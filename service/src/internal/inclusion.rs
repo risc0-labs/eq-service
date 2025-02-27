@@ -182,10 +182,10 @@ impl InclusionService {
                     .get(zk_program_elf_sha3)
                     .map_err(|e| InclusionServiceError::InternalError(e.to_string()))?;
 
-                let proof_setup = if let Some(precomputed) = precomputed_proof_setup {
+                let proof_setup = match precomputed_proof_setup { Some(precomputed) => {
                     bincode::deserialize(&precomputed)
                         .map_err(|e| InclusionServiceError::InternalError(e.to_string()))?
-                } else {
+                } _ => {
                     info!(
                         "No ZK proof setup in DB for SHA3_256 = 0x{} -- generation & storing in config DB",
                         hex::encode(zk_program_elf_sha3)
@@ -206,7 +206,7 @@ impl InclusionService {
                         .map_err(|e| InclusionServiceError::InternalError(e.to_string()))?;
 
                     new_proof_setup
-                };
+                }};
                 Ok(Arc::new(proof_setup))
             })
             .await?
@@ -290,7 +290,9 @@ impl InclusionService {
             JsonRpcError::Call(error_object) => {
                 // TODO: make this handle errors much better! JSON stringiness is a problem!
                 if error_object.message().starts_with("header: not found") {
-                    e = InclusionServiceError::DaClientError(format!("{call_err} - Likely DA Node is not properly synced, and blob does exists on the network. PLEASE REPORT!"));
+                    e = InclusionServiceError::DaClientError(format!(
+                        "{call_err} - Likely DA Node is not properly synced, and blob does exists on the network. PLEASE REPORT!"
+                    ));
                     job_status = JobStatus::Failed(
                         e.clone(),
                         Some(JobStatus::DataAvailabilityPending.into()),
@@ -359,9 +361,9 @@ impl InclusionService {
         let (e, job_status);
         match zk_client_error {
             SP1NetworkError::SimulationFailed | SP1NetworkError::RequestUnexecutable { .. } => {
-                e = InclusionServiceError::DaClientError(
-                    format!("ZKP program critical failure: {zk_client_error} occured for {job:?} PLEASE REPORT!"),
-                );
+                e = InclusionServiceError::DaClientError(format!(
+                    "ZKP program critical failure: {zk_client_error} occured for {job:?} PLEASE REPORT!"
+                ));
                 job_status = JobStatus::Failed(e.clone(), None);
             }
             SP1NetworkError::RequestUnfulfillable { .. } => {
