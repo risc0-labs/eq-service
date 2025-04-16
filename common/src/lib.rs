@@ -1,5 +1,4 @@
-use celestia_types::nmt::{Namespace, NamespaceProof};
-use celestia_types::RowProof;
+use celestia_types::{RowProof, nmt::{Namespace, NamespaceProof}};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "host")]

@@ -5,6 +5,7 @@ use tonic::{Request, Response, Status};
 
 use eq_common::eqs::inclusion_server::Inclusion;
 use eq_common::eqs::{
+    ProofWithPublicValues,
     get_keccak_inclusion_response::{ResponseValue, Status as ResponseStatus},
     GetKeccakInclusionRequest, GetKeccakInclusionResponse,
 };
@@ -53,12 +54,13 @@ impl Inclusion for InclusionServiceArc {
             match job_status {
                 JobStatus::ZkProofFinished(proof) => {
                     debug!("Job finished, returning proof");
+
                     return Ok(Response::new(GetKeccakInclusionResponse {
                         status: ResponseStatus::ZkpFinished as i32,
-                        response_value: Some(ResponseValue::Proof(
-                            bincode::serialize(&proof)
-                                .map_err(|e| Status::internal(e.to_string()))?,
-                        )),
+                        response_value: Some(ResponseValue::Proof(ProofWithPublicValues {
+                            proof_data: proof.bytes(),
+                            public_values: proof.public_values.to_vec(),
+                        })),
                     }));
                 }
                 JobStatus::Failed(error, maybe_status) => {
@@ -75,7 +77,7 @@ impl Inclusion for InclusionServiceArc {
                         Some(retry_status) => {
                             warn!("Job is Retryable Failure, returning status & retrying");
                             // We retry errors on each call to the gRPC
-                            // for a specific [Job] by seding to the queue
+                            // for a specific [Job] by sending to the queue
                             match self.0.send_job_with_new_status(job_key, *retry_status, job) {
                                 Ok(_) => {
                                     return Ok(Response::new(GetKeccakInclusionResponse {
