@@ -439,7 +439,7 @@ impl InclusionService {
             .prove(&proof_setup.pk, &stdin)
             .groth16()
             .skip_simulation(false)
-            .timeout(Duration::from_secs(5)) // Don't hang too long on this. If it's gonna fail, fail fast.
+            //.timeout(Duration::from_secs(5)) // Don't hang too long on this. If it's gonna fail, fail fast.
             .request_async()
             .await
             // TODO: how to handle errors without a concrete type? Anyhow is not the right thing for us...
