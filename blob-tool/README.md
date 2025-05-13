@@ -4,6 +4,10 @@ This utility is to help in **development & testing** basic operations with a Cel
 Given specifics about a datum, a NMT proof is saved to `./proof_input.json`.
 This JSON can be used in [another utility](../runner-keccak-inclusion) to **test creation of a ZK proof** that ultimately the [`eq-service` provides for it's users](../README.md).
 
+## Requirements
+
+You must run a local Celestia Node, hardcoded to use `ws://localhost:26658` to connect.
+
 ## Usage
 
 ```sh
@@ -12,12 +16,12 @@ This JSON can be used in [another utility](../runner-keccak-inclusion) to **test
 # Tesetnet: https://mocha-4.celenium.io/
 cargo r -- --height <integer> --namespace "hex string" --commitment "base64 string"
 
-# Known working example from the Mocha Testnet:
-# https://mocha-4.celenium.io/blob?commitment=Ok8KERqJ3my8Z/D4DX6DfUDaeoMR0iUlxOrX1YsrAg4=&hash=AAAAAAAAAAAAAAAAAAAAAAAAAMod4SoDpykQeR8=&height=4337783
-# The first commitment in https://mocha-4.celenium.io/tx/d88d60f4fb783cc24ab07688ed6f05a50e32d58823df00e2d99ffc5ad5f74b47
-cargo r -- --height 4337783 --namespace "ca1de12a03a72910791f" --commitment "Ok8KERqJ3my8Z/D4DX6DfUDaeoMR0iUlxOrX1YsrAg4="
+# Known working example from the Mocha Testnet (~1.5MB):
+# https://mocha.celenium.io/tx/30a274a332e812df43cef70f395c413df191857ed581b68c44f05a3c5c322312
+cargo r -- --height 5967025 --namespace "c27fc4694d31d1" --commitment "Y+8haW3Hi89DdtT4AAgr1iZ4ELFbosTqF+UCnhc4adM="
 
-# getting blob...
-# getting nmt multiproofs...
-# Wrote proof input to proof_input.json
+# Known working example from the Mocha Testnet (~0.125MB):
+# https://mocha-4.celenium.io/tx/a54e3b86dc095180ecda631e67e25ef9d8450dc1de5bd2af4dc2cfa50b4b3ac4
+cargo r -- --height 6062832 --namespace "5d251311f25b13a549e0" --commitment "JPqS2PmVBNdyo8IadhIgIzvgbV99LQido2LAEaCp+vY="
+
 ```
