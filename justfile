@@ -17,7 +17,7 @@ zkvm-elf-path := "./target/elf-compilation/riscv32im-succinct-zkvm-elf/release/e
 env-settings := "./.env"
 sp1up-path := shell("which sp1up")
 cargo-prove-path := shell("which cargo-prove")
-websocat-path := shell("which cargo-prove")
+websocat-path := shell("which websocat")
 
 # Install SP1 tooling & more
 initial-config-installs:
@@ -39,15 +39,27 @@ _pre-build:
         echo -e "⛔ Missing zkVM Compiler.\nRun `just initial-config-installs` to prepare your environment"
         exit 1
     fi
-    if ! {{ path_exists(zkvm-elf-path) }}; then
-        cargo prove build -p eq-program-keccak-inclusion
-    fi
+    @just build-elf
 
 _pre-run:
     #!/usr/bin/env bash
     if ! {{ path_exists(env-settings) }}; then
         echo -e "⛔ Missing required \`{{ env-settings }}\` file.\nCreate one with:\n\n\tcp example.env .env\n\nAnd then edit to adjust settings"
         exit 1
+    fi
+
+# Build only the zkVM ELF program in release mode (optimized)
+build-elf:
+    if ! {{ path_exists(cargo-prove-path) }}; then \
+        echo -e "⛔ Missing zkVM Compiler.\nRun \`just initial-config-installs\` to prepare your environment"; \
+        exit 1; \
+    fi; \
+    source {{ env-settings }}; \
+    if [ ! -f "$ZK_PROGRAM_ELF_PATH" ]; then \
+        echo -e "Can't find ELF at \`$ZK_PROGRAM_ELF_PATH\`.\nAttempting to build it..."; \
+        RUSTFLAGS="-Copt-level=3 -Clto=fat -Ccodegen-units=1 -Cdebuginfo=1 -Cembed-bitcode=yes" cargo prove build -p eq-program-keccak-inclusion \
+    else \
+        echo "✅ ELF Exists, skipping SP1 build"; \
     fi
 
 # Run examples
