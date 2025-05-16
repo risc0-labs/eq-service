@@ -1,4 +1,5 @@
 /target
+/program-keccak-inclusion/guest/target
 /elf
 .env
 **/*.json

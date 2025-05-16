@@ -14,3 +14,9 @@ nmt-rs = "0.2"
 tendermint = "0.40"
 tendermint-proto = "0.40"
 sha3 = "0.10"
+
+[patch.crates-io]
+# sha3-v0-10-8 = { git = "https://github.com/risc0/RustCrypto-hashes", package = "sha3", branch = "patch-sha3-v0.10.8" } # no patch yet?
+sha2-v0-9-9 = { git = "https://github.com/risc0/RustCrypto-hashes", package = "sha2", tag = "sha2-v0.9.9-risczero.0" }
+sha2-v0-10-8 = { git = "https://github.com/risc0/RustCrypto-hashes", package = "sha2", tag = "sha2-v0.10.8-risczero.0" }
+# curve25519-dalek = { git = "https://github.com/risc0/curve25519-dalek", tag = "curve25519-4.1.1-risczero.0" } # no patch for -ng version of this crate, have one for curve25519-dalek crate instead. Should support this soon
