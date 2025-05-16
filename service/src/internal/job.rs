@@ -1,9 +1,8 @@
+use bonsai_sdk::non_blocking::SessionId;
 use eq_common::{InclusionServiceError, KeccakInclusionToDataRootProofInput};
 use eq_sdk::types::BlobId;
+use risc0_zkvm::Receipt;
 use serde::{Deserialize, Serialize};
-use sp1_sdk::SP1ProofWithPublicValues;
-
-use crate::SuccNetJobId;
 
 /// A job for the service, mapped to a [BlobId]
 pub type Job = BlobId;
@@ -19,12 +18,9 @@ pub enum JobStatus {
     /// DA inclusion is processed and ready to send to the ZK prover
     DataAvailable(KeccakInclusionToDataRootProofInput),
     /// A ZK prover job had been requested, awaiting response
-    ZkProofPending(SuccNetJobId),
+    ZkProofPending(SessionId),
     /// A ZK proof is ready, and the [Job] is complete
-    // For now we'll use the SP1ProofWithPublicValues as the proof
-    // Ideally we only want the public values + whatever is needed to verify the proof
-    // They don't seem to provide a type for that.
-    ZkProofFinished(SP1ProofWithPublicValues),
+    ZkProofFinished(Receipt),
     /// A wrapper for any [InclusionServiceError], with:
     /// - Option = None                        --> Permanent failure
     /// - Option = Some(\<retry-able status\>) --> Retry is possible, with a JobStatus state to retry with

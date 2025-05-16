@@ -51,14 +51,18 @@ impl Inclusion for InclusionServiceArc {
             let job_status: JobStatus =
                 bincode::deserialize(&proof_data).map_err(|e| Status::internal(e.to_string()))?;
             match job_status {
-                JobStatus::ZkProofFinished(proof) => {
+                JobStatus::ZkProofFinished(receipt) => {
                     debug!("Job finished, returning proof");
 
                     return Ok(Response::new(GetKeccakInclusionResponse {
                         status: ResponseStatus::ZkpFinished as i32,
                         response_value: Some(ResponseValue::Proof(ProofWithPublicValues {
-                            proof_data: proof.bytes(),
-                            public_values: proof.public_values.to_vec(),
+                            proof_data: receipt
+                                .inner
+                                .groth16()
+                                .expect("wrong proof type created, expected groth16")
+                                .seal,
+                            public_values: receipt.journal.bytes,
                         })),
                     }));
                 }
