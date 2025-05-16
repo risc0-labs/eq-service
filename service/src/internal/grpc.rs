@@ -51,14 +51,21 @@ impl Inclusion for InclusionServiceArc {
             let job_status: JobStatus =
                 bincode::deserialize(&proof_data).map_err(|e| Status::internal(e.to_string()))?;
             match job_status {
-                JobStatus::ZkProofFinished(proof) => {
+                JobStatus::ZkProofFinished(receipt) => {
                     debug!("Job finished, returning proof");
 
                     return Ok(Response::new(GetKeccakInclusionResponse {
                         status: ResponseStatus::ZkpFinished as i32,
                         response_value: Some(ResponseValue::Proof(ProofWithPublicValues {
-                            proof_data: proof.bytes(),
-                            public_values: proof.public_values.to_vec(),
+                            proof_data: bytemuck::cast_slice(
+                                &receipt
+                                    .inner
+                                    .succinct()
+                                    .expect("wrong proof type created by proving service")
+                                    .seal,
+                            )
+                            .to_vec(),
+                            public_values: receipt.journal.bytes,
                         })),
                     }));
                 }
@@ -136,7 +143,7 @@ impl Inclusion for InclusionServiceArc {
                 JobStatus::ZkProofPending(job_id) => {
                     return Ok(Response::new(GetKeccakInclusionResponse {
                         status: ResponseStatus::ZkpPending as i32,
-                        response_value: Some(ResponseValue::ProofId(job_id.to_vec())),
+                        response_value: Some(ResponseValue::ProofId(job_id.uuid.into_bytes())),
                     }));
                 }
                 _ => {

@@ -734,6 +734,7 @@ dependencies = [
  "reqwest",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -782,9 +783,9 @@ checksum = "7575182f7272186991736b70173b0ea045398f984bf5ebbb3804736ce1330c9d"
 
 [[package]]
 name = "bytemuck"
-version = "1.22.0"
+version = "1.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6b1fc10dbac614ebc03540c9dbd60e83887fda27794998c6528f1782047d540"
+checksum = "9134a6ef01ce4b366b50689c94f82c14bc72bc5d0386829828a2e2752ef7958c"
 dependencies = [
  "bytemuck_derive",
 ]
@@ -1584,12 +1585,16 @@ dependencies = [
 name = "eq-service"
 version = "0.1.6"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "bincode",
+ "bonsai-sdk",
+ "bytemuck",
  "celestia-rpc",
  "celestia-types",
  "env_logger",
  "eq-common",
+ "eq-program-keccak-inclusion",
  "eq-sdk",
  "hex",
  "jsonrpsee",
@@ -4367,6 +4372,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9203b8055f63a2a00e2f593bb0510367fe707d7ff1e5c872de2f537b339e5410"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "signature"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4737,6 +4751,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.52.0",
