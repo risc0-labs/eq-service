@@ -7,8 +7,8 @@ use jsonrpsee::core::ClientError as JsonRpcError;
 use log::{debug, error, info};
 use risc0_zkvm::serde::to_vec;
 use risc0_zkvm::{compute_image_id, Receipt};
+use sha3::Digest;
 use sha3::Keccak256;
-use sha3::{Digest, Sha3_256};
 use sled::{Transactional, Tree as SledTree};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,8 +18,6 @@ use eq_program_keccak_inclusion::{
     EQ_PROGRAM_KECCAK_INCLUSION_GUEST_ELF as KECCAK_INCLUSION_ELF,
     EQ_PROGRAM_KECCAK_INCLUSION_GUEST_ID as KECCAK_INCLUSION_ID,
 };
-
-type ProgramId = [u32; 8];
 
 /// The main service, depends on external DA and ZK clients internally!
 pub struct InclusionService {
@@ -111,10 +109,7 @@ impl InclusionService {
                 }
                 JobStatus::DataAvailable(proof_input) => {
                     // TODO handle non-hardcoded ZK programs
-                    match self
-                        .request_zk_proof(&KECCAK_INCLUSION_ID, &proof_input, &job, &job_key)
-                        .await
-                    {
+                    match self.request_zk_proof(&proof_input).await {
                         Ok(zk_job_id) => {
                             job_status = JobStatus::ZkProofPending(zk_job_id);
                             self.send_job_with_new_status(job_key, job_status, job)?;
@@ -122,7 +117,7 @@ impl InclusionService {
                         Err(e) => {
                             error!("{job:?} failed progressing DataAvailable: {e}");
                             job_status = JobStatus::Failed(
-                                e,
+                                InclusionServiceError::ZkClientError(e.to_string()),
                                 Some(JobStatus::DataAvailable(proof_input).into()),
                             );
                             self.finalize_job(&job_key, job_status)?;
@@ -132,7 +127,7 @@ impl InclusionService {
                 }
                 JobStatus::ZkProofPending(zk_request_id) => {
                     debug!("ZK request waiting");
-                    match self.wait_for_zk_proof(&job_key, zk_request_id).await {
+                    match self.wait_for_zk_proof(zk_request_id.clone()).await {
                         Ok(zk_proof) => {
                             info!("🎉 {job:?} Finished!");
                             job_status = JobStatus::ZkProofFinished(zk_proof);
@@ -141,7 +136,7 @@ impl InclusionService {
                         Err(e) => {
                             error!("{job:?} failed progressing ZkProofPending: {e}");
                             job_status = JobStatus::Failed(
-                                e,
+                                InclusionServiceError::ZkClientError(e.to_string()),
                                 Some(JobStatus::ZkProofPending(zk_request_id).into()),
                             );
                             self.finalize_job(&job_key, job_status)?;
@@ -300,66 +295,11 @@ impl InclusionService {
         }
     }
 
-    /// Helper function to handle error from a SP1 NetworkProver Clients.
-    /// Will finalize the job in an [JobStatus::Failed] state,
-    /// that may be retryable.
-    fn handle_zk_client_error(
-        &self,
-        zk_client_error: &SP1NetworkError,
-        job: &Job,
-        job_key: &[u8],
-    ) -> InclusionServiceError {
-        error!("SP1 Client error: {zk_client_error}");
-        let (e, job_status);
-        match zk_client_error {
-            SP1NetworkError::SimulationFailed | SP1NetworkError::RequestUnexecutable { .. } => {
-                e = InclusionServiceError::DaClientError(format!(
-                    "ZKP program critical failure: {zk_client_error} occurred for {job:?} PLEASE REPORT!"
-                ));
-                job_status = JobStatus::Failed(e.clone(), None);
-            }
-            SP1NetworkError::RequestUnfulfillable { .. } => {
-                e = InclusionServiceError::DaClientError(format!(
-                    "ZKP network failure: {zk_client_error} occurred  for {job:?} PLEASE REPORT!"
-                ));
-                job_status = JobStatus::Failed(e.clone(), None);
-            }
-            SP1NetworkError::RequestTimedOut { request_id } => {
-                e = InclusionServiceError::DaClientError(format!(
-                    "ZKP network: {zk_client_error} occurred  for {job:?}"
-                ));
-
-                let id = request_id
-                    .as_slice()
-                    .try_into()
-                    .expect("request ID is always correct length");
-                job_status =
-                    JobStatus::Failed(e.clone(), Some(JobStatus::ZkProofPending(id).into()));
-            }
-            SP1NetworkError::RpcError(_) | SP1NetworkError::Other(_) => {
-                e = InclusionServiceError::DaClientError(format!(
-                    "ZKP network failure: {zk_client_error} occurred  for {job:?} PLEASE REPORT!"
-                ));
-                // TODO: We cannot clone KeccakInclusionToDataRootProofInput thus we cannot insert into a JobStatus::DataAvailable(proof_input)
-                // So we just redo the work from scratch for the DA side as a stupid workaround
-                job_status =
-                    JobStatus::Failed(e.clone(), Some(JobStatus::DataAvailabilityPending.into()));
-            }
-        }
-        match self.finalize_job(job_key, job_status) {
-            Ok(_) => e,
-            Err(internal_err) => internal_err,
-        }
-    }
-
     /// Start a proof request from Succinct's prover network
     pub async fn request_zk_proof(
         &self,
-        program_id: &ProgramId,
         proof_input: &KeccakInclusionToDataRootProofInput,
-        job: &Job,
-        job_key: &[u8],
-    ) -> Result<SessionId, InclusionServiceError> {
+    ) -> Result<SessionId, anyhow::Error> {
         debug!("Preparing prover network request and starting proving");
         let zk_client_handle = self.get_zk_client_remote().await;
 
@@ -383,34 +323,42 @@ impl InclusionService {
     }
 
     /// Await a proof request from Succinct's prover network
-    async fn wait_for_zk_proof(
-        &self,
-        job_key: &[u8],
-        request_id: SessionId,
-    ) -> Result<Receipt, InclusionServiceError> {
+    async fn wait_for_zk_proof(&self, request_id: SessionId) -> Result<Receipt, anyhow::Error> {
         debug!("Waiting for proof from prover network");
         let zk_client_handle = self.get_zk_client_remote().await;
 
-        let proof = zk_client_handle
-            .wait_proof(request_id.into(), None)
-            .await
-            .map_err(|e| {
-                error!("UNHANDLED ZK client error: {e:?}");
-                let e = InclusionServiceError::ZkClientError(
-                    "UNKNOWN ZK client error. PLEASE REPORT!".to_string(),
+        loop {
+            let res = request_id.status(&zk_client_handle).await?;
+            if res.status == "RUNNING" {
+                eprintln!(
+                    "Current status: {} - state: {} - continue polling...",
+                    res.status,
+                    res.state.unwrap_or_default()
                 );
-                match self.finalize_job(
-                    job_key,
-                    JobStatus::Failed(
-                        e.clone(),
-                        Some(JobStatus::ZkProofPending(request_id).into()),
-                    ),
-                ) {
-                    Ok(_) => e,
-                    Err(internal_err) => internal_err,
-                }
-            })?;
-        Ok(proof)
+                std::thread::sleep(Duration::from_secs(15));
+                continue;
+            }
+            if res.status == "SUCCEEDED" {
+                // Download the receipt, containing the output
+                let receipt_url = res
+                    .receipt_url
+                    .expect("API error, missing receipt on completed session");
+
+                let receipt_buf = zk_client_handle.download(&receipt_url).await?;
+                let receipt: Receipt = bincode::deserialize(&receipt_buf)?;
+                receipt
+                    .verify(KECCAK_INCLUSION_ID)
+                    .expect("Receipt verification failed");
+
+                return Ok(receipt);
+            } else {
+                panic!(
+                    "Workflow exited: {} - | err: {}",
+                    res.status,
+                    res.error_msg.unwrap_or_default()
+                );
+            }
+        }
     }
 
     /// Atomically move a job from the database queue tree to the proof tree.

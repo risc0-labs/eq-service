@@ -16,8 +16,8 @@ use tonic::transport::Server;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    std::env::var("NETWORK_PRIVATE_KEY")
-        .expect("NETWORK_PRIVATE_KEY for Succinct Prover env var required");
+    std::env::var("BONSAI_API_URL").expect("BONSAI_API_URL for Bonsai Prover env var required");
+    std::env::var("BONSAI_API_KEY").expect("BONSAI_API_KEY for Bonsai Prover env var required");
     let da_node_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN")
         .expect("CELESTIA_NODE_AUTH_TOKEN env var required");
     let da_node_ws = std::env::var("CELESTIA_NODE_WS").expect("CELESTIA_NODE_WS env var required");
@@ -50,10 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn({
         let service = inclusion_service.clone();
         async move {
-            let program_id = get_program_id().await;
-            let zk_client = service.clone().get_zk_client_remote().await;
-            debug!("ZK client prepared, acquiring setup");
-            let _ = service.get_proof_setup(&program_id, zk_client).await;
+            let _zk_client = service.clone().get_zk_client_remote().await;
             info!("ZK client ready!");
         }
         // TODO: crash whole program if this fails

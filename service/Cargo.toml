@@ -29,3 +29,4 @@ jsonrpsee = {workspace=true}
 sha3 = {workspace=true}
 bonsai-sdk = { version = "1.4.0", features = ["non_blocking"] }
 bytemuck = "1.23.0"
+anyhow = "1.0.98"

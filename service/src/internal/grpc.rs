@@ -57,11 +57,14 @@ impl Inclusion for InclusionServiceArc {
                     return Ok(Response::new(GetKeccakInclusionResponse {
                         status: ResponseStatus::ZkpFinished as i32,
                         response_value: Some(ResponseValue::Proof(ProofWithPublicValues {
-                            proof_data: receipt
-                                .inner
-                                .groth16()
-                                .expect("wrong proof type created, expected groth16")
-                                .seal,
+                            proof_data: bytemuck::cast_slice(
+                                &receipt
+                                    .inner
+                                    .succinct()
+                                    .expect("wrong proof type created by proving service")
+                                    .seal,
+                            )
+                            .to_vec(),
                             public_values: receipt.journal.bytes,
                         })),
                     }));
@@ -140,7 +143,7 @@ impl Inclusion for InclusionServiceArc {
                 JobStatus::ZkProofPending(job_id) => {
                     return Ok(Response::new(GetKeccakInclusionResponse {
                         status: ResponseStatus::ZkpPending as i32,
-                        response_value: Some(ResponseValue::ProofId(job_id.to_vec())),
+                        response_value: Some(ResponseValue::ProofId(job_id.uuid.into_bytes())),
                     }));
                 }
                 _ => {
