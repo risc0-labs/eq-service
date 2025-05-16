@@ -1,0 +1,16 @@
+[package]
+name = "eq-program-keccak-inclusion-guest"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+eq-common = {path = "../../common", default-features = false}
+
+risc0-zkvm = "2.0.2"
+celestia-types = "0.10"
+nmt-rs = "0.2"
+tendermint = "0.40"
+tendermint-proto = "0.40"
+sha3 = "0.10"

@@ -24,8 +24,9 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    let node_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN").expect("Token not provided");
-    let client = Client::new("ws://localhost:26658", Some(&node_token))
+    let node_url = std::env::var("CELESTIA_NODE_WS").expect("CELESTIA_NODE_WS env var required");
+    let node_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN").ok();
+    let client = Client::new(&node_url, node_token.as_deref())
         .await
         .expect("Failed creating celestia rpc client");
 

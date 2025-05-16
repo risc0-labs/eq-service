@@ -1,14 +1,13 @@
-#![doc = include_str!("../README.md")]
-#![no_main]
+#![doc = include_str!("../../README.md")]
 
-sp1_zkvm::entrypoint!(main);
 use celestia_types::{blob::Blob, hash::Hash, AppVersion, ShareProof};
 use eq_common::{KeccakInclusionToDataRootProofInput, KeccakInclusionToDataRootProofOutput};
+use risc0_zkvm::guest::env;
 use sha3::{Digest, Keccak256};
 
 pub fn main() {
     println!("cycle-tracker-start: deserialize input");
-    let input: KeccakInclusionToDataRootProofInput = sp1_zkvm::io::read();
+    let input: KeccakInclusionToDataRootProofInput = env::read();
     let data_root_as_hash = Hash::Sha256(input.data_root);
     println!("cycle-tracker-end: deserialize input");
 
@@ -53,6 +52,6 @@ pub fn main() {
         data_root: input.data_root,
     }
     .to_vec();
-    sp1_zkvm::io::commit_slice(&output);
+    env::commit_slice(&output);
     println!("cycle-tracker-end: commit output");
 }
