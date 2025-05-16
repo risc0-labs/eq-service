@@ -34,7 +34,7 @@ flowchart TB
 
     lc --->|GET NMT Inclusion| cel{Celestia}
 
-    zkc --->|POST Proof Generation| pn{ZK Prover Network}
+    zkc --->|POST Proof Generation| pn{ZK Centralized Proving Service}
     style zkep fill:#66f
     style jobs fill:#888
 ```
@@ -45,7 +45,7 @@ The service **_requires_** a connection to:
    - Fetch blob data.
    - Get headers.
    - Retrieve Merkle tree proofs for blobs.
-1. [RISC0's prover network Bonsai](https://risczero.com/bonsai) as a provider to generate Zero-Knowledge Proofs (ZKPs) of data existing on Celestia.
+1. [RISC0's Centralized Proving Service Bonsai](https://risczero.com/bonsai) as a provider to generate Zero-Knowledge Proofs (ZKPs) of data existing on Celestia.
    _See the [ZKP program](./program-keccak-inclusion/src/main.rs) for details on what is proven._
 
 ## Interact
@@ -110,10 +110,10 @@ To build and run, see [developing instructions](#develop)
    - Ports accessible (by default):
      - service listening at `50051`
      - Light client (local or remote) over `26658`
-     - Bonsai prover network over `443`
+     - Bonsai centralized proving service over `443`
    - **NOTE:** These requirements may be significantly more to respond under heavy load, please report if you have issues!
 
-1. A whitelisted key in your `env` for use with the Bonsai prover network Key - [requested here](https://risczero.com/bonsai).
+1. A whitelisted key in your `env` for use with the Bonsai centralized proving service Key - [requested here](https://risczero.com/bonsai).
 
 1. A Celestia Light Node [installed](https://docs.celestia.org/how-to-guides/celestia-node) & [running](https://docs.celestia.org/tutorials/node-tutorial#auth-token) accessible on `localhost`, or elsewhere.
    Alternatively, use [an RPC provider](https://github.com/celestiaorg/awesome-celestia/?tab=readme-ov-file#node-operator-contributions) you trust.
