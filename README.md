@@ -1,7 +1,7 @@
 # Data Availability Equivalence Service
 
 A gRPC service acting as a "cryptographic adapter" providing proofs that data (a blob) exists on [Celestia](https://celestia.org/) that are efficiently verifiable on EVM networks.
-A [Namespace Merkle Tree (NMT)](https://celestia.org/glossary/namespaced-merkle-tree/) proof is transformed via a [Zero Knowledge Proof (ZKP)](https://docs.succinct.xyz/docs/sp1/what-is-a-zkvm) into a keccak hash check.
+A [Namespace Merkle Tree (NMT)](https://celestia.org/glossary/namespaced-merkle-tree/) proof is transformed via a Zero Knowledge Proof (ZKP) into a keccak hash check.
 
 A few key features:
 
@@ -45,7 +45,7 @@ The service **_requires_** a connection to:
    - Fetch blob data.
    - Get headers.
    - Retrieve Merkle tree proofs for blobs.
-1. [Succinct's prover network](https://docs.succinct.xyz/docs/sp1/generating-proofs/prover-network) as a provider to generate Zero-Knowledge Proofs (ZKPs) of data existing on Celestia.
+1. [RISC0's prover network Bonsai](https://risczero.com/bonsai) as a provider to generate Zero-Knowledge Proofs (ZKPs) of data existing on Celestia.
    _See the [ZKP program](./program-keccak-inclusion/src/main.rs) for details on what is proven._
 
 ## Interact
@@ -110,7 +110,7 @@ To build and run, see [developing instructions](#develop)
    - Ports accessible (by default):
      - service listening at `50051`
      - Light client (local or remote) over `26658`
-     - Succinct prover network over `443`
+     - Bonsai prover network over `443`
    - **NOTE:** These requirements may be significantly more to respond under heavy load, please report if you have issues!
 
 1. A whitelisted key in your `env` for use with the Bonsai prover network Key - [requested here](https://risczero.com/bonsai).
@@ -150,7 +150,7 @@ _Don't forget you need to [configure your environment](#configure)_.
 First, some tooling is required:
 
 1. Rust & Cargo - [install instructions](https://www.rust-lang.org/tools/install)
-1. Succinct's SP1 zkVM Toolchain - [install instructions](https://docs.succinct.xyz/docs/sp1/getting-started/install)
+1. RISC0's zkVM Toolchain - [install instructions](https://dev.risczero.com/api/zkvm/quickstart)
 1. Protocol Buffers (Protobuf) compiler - [official examples](https://github.com/hyperium/tonic/tree/master/examples#examples) contain install instructions
 1. (Optional) Just - a modern alternative to `make` [installed](https://just.systems/man/en/packages.html)
 
@@ -208,7 +208,7 @@ mkdir -p $EQ_DB_PATH
 [docker|podman] run --rm -it -v $EQ_DB_PATH:$EQ_DB_PATH --env-file .env --env RUST_LOG=eq_service=debug --network=host -p $EQ_PORT:$EQ_PORT eq_service
 ```
 
-Importantly, the DB should persist, and the container must have access to connect to the DA light client (likely port 26658) and Succinct network ports (HTTPS over 443).
+Importantly, the DB should persist, and the container must have access to connect to the DA light client (likely port 26658) and Bonsai network ports (HTTPS over 443).
 
 The images are built and published for [releases](https://github.com/celestiaorg/eq-service/releases) - see [running containers](#running-containers) for how to pull them.
 
