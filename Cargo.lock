@@ -1592,6 +1592,7 @@ version = "0.1.7"
 dependencies = [
  "base64 0.22.1",
  "celestia-types",
+ "clap",
  "eq-common",
  "serde",
  "tokio",
