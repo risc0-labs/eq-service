@@ -71,7 +71,8 @@ impl InclusionService {
 
 pub struct InclusionServiceConfig {
     pub da_node_token: String,
-    pub da_node_ws: String,
+    pub da_node_http: String,
+    pub zk_proof_gen_timeout: Duration,
 }
 
 impl InclusionService {
@@ -131,23 +132,19 @@ impl InclusionService {
                         .await
                     {
                         Ok(zk_job_id) => {
+                            debug!("Proof request {zk_job_id:?} started");
                             job_status = JobStatus::ZkProofPending(zk_job_id);
                             self.send_job_with_new_status(job_key, job_status, job)?;
                         }
                         Err(e) => {
                             error!("{job:?} failed progressing DataAvailable: {e}");
-                            job_status = JobStatus::Failed(
-                                e,
-                                Some(JobStatus::DataAvailable(proof_input).into()),
-                            );
-                            self.finalize_job(&job_key, job_status)?;
+                            // NOTE: we internally finalize the job in `handle_da_client_error`
                         }
                     };
-                    debug!("ZK request sent");
                 }
                 JobStatus::ZkProofPending(zk_request_id) => {
                     debug!("ZK request waiting");
-                    match self.wait_for_zk_proof(&job_key, zk_request_id).await {
+                    match self.wait_for_zk_proof(&job, &job_key, zk_request_id).await {
                         Ok(zk_proof) => {
                             info!("🎉 {job:?} Finished!");
                             job_status = JobStatus::ZkProofFinished(zk_proof);
@@ -155,14 +152,9 @@ impl InclusionService {
                         }
                         Err(e) => {
                             error!("{job:?} failed progressing ZkProofPending: {e}");
-                            job_status = JobStatus::Failed(
-                                e,
-                                Some(JobStatus::ZkProofPending(zk_request_id).into()),
-                            );
-                            self.finalize_job(&job_key, job_status)?;
+                            // NOTE: we internally finalize the job in `handle_zk_client_error`
                         }
                     }
-                    debug!("ZK request fulfilled");
                 }
                 _ => error!("Queue has INVALID status! Finished jobs stuck in queue!"),
             }
@@ -380,32 +372,30 @@ impl InclusionService {
         let (e, job_status);
         match zk_client_error {
             SP1NetworkError::SimulationFailed | SP1NetworkError::RequestUnexecutable { .. } => {
-                e = InclusionServiceError::DaClientError(format!(
+                e = InclusionServiceError::ZkClientError(format!(
                     "ZKP program critical failure: {zk_client_error} occurred for {job:?} PLEASE REPORT!"
                 ));
                 job_status = JobStatus::Failed(e.clone(), None);
             }
             SP1NetworkError::RequestUnfulfillable { .. } => {
-                e = InclusionServiceError::DaClientError(format!(
-                    "ZKP network failure: {zk_client_error} occurred  for {job:?} PLEASE REPORT!"
+                e = InclusionServiceError::ZkClientError(format!(
+                    "ZKP network failure: {zk_client_error} occurred for {job:?} PLEASE REPORT!"
                 ));
                 job_status = JobStatus::Failed(e.clone(), None);
             }
-            SP1NetworkError::RequestTimedOut { request_id } => {
-                e = InclusionServiceError::DaClientError(format!(
-                    "ZKP network: {zk_client_error} occurred  for {job:?}"
+            SP1NetworkError::RequestTimedOut { .. } => {
+                e = InclusionServiceError::ZkClientError(format!(
+                    "ZKP network: {zk_client_error} occurred for {job:?} - callback to start the job over"
                 ));
 
-                let id = request_id
-                    .as_slice()
-                    .try_into()
-                    .expect("request ID is always correct length");
+                // TODO: We cannot clone KeccakInclusionToDataRootProofInput thus we cannot insert into a JobStatus::DataAvailable(proof_input)
+                // So we just redo the work from scratch for the DA side as a stupid workaround
                 job_status =
-                    JobStatus::Failed(e.clone(), Some(JobStatus::ZkProofPending(id).into()));
+                    JobStatus::Failed(e.clone(), Some(JobStatus::DataAvailabilityPending.into()));
             }
             SP1NetworkError::RpcError(_) | SP1NetworkError::Other(_) => {
-                e = InclusionServiceError::DaClientError(format!(
-                    "ZKP network failure: {zk_client_error} occurred  for {job:?} PLEASE REPORT!"
+                e = InclusionServiceError::ZkClientError(format!(
+                    "ZKP network failure: {zk_client_error} occurred for {job:?} PLEASE REPORT!"
                 ));
                 // TODO: We cannot clone KeccakInclusionToDataRootProofInput thus we cannot insert into a JobStatus::DataAvailable(proof_input)
                 // So we just redo the work from scratch for the DA side as a stupid workaround
@@ -439,7 +429,7 @@ impl InclusionService {
             .prove(&proof_setup.pk, &stdin)
             .groth16()
             .skip_simulation(false)
-            .timeout(Duration::from_secs(5)) // Don't hang too long on this. If it's gonna fail, fail fast.
+            .timeout(self.config.zk_proof_gen_timeout)
             .request_async()
             .await
             // TODO: how to handle errors without a concrete type? Anyhow is not the right thing for us...
@@ -447,6 +437,7 @@ impl InclusionService {
                 if let Some(down) = e.downcast_ref::<SP1NetworkError>() {
                     return self.handle_zk_client_error(down, job, job_key);
                 }
+                error!("UNHANDLED ZK client error: {e:?}");
                 InclusionServiceError::ZkClientError(format!("Unhandled Error: {e} PLEASE REPORT"))
             })?
             .into();
@@ -457,6 +448,7 @@ impl InclusionService {
     /// Await a proof request from Succinct's prover network
     async fn wait_for_zk_proof(
         &self,
+        job: &Job,
         job_key: &[u8],
         request_id: SuccNetJobId,
     ) -> Result<SP1ProofWithPublicValues, InclusionServiceError> {
@@ -467,21 +459,13 @@ impl InclusionService {
             .wait_proof(request_id.into(), None)
             .await
             .map_err(|e| {
-                error!("UNHANDLED ZK client error: {e:?}");
-                let e = InclusionServiceError::ZkClientError(
-                    "UNKNOWN ZK client error. PLEASE REPORT!".to_string(),
-                );
-                match self.finalize_job(
-                    job_key,
-                    JobStatus::Failed(
-                        e.clone(),
-                        Some(JobStatus::ZkProofPending(request_id).into()),
-                    ),
-                ) {
-                    Ok(_) => e,
-                    Err(internal_err) => internal_err,
+                if let Some(down) = e.downcast_ref::<SP1NetworkError>() {
+                    return self.handle_zk_client_error(down, job, job_key);
                 }
+                error!("UNHANDLED ZK client error: {e:?}");
+                InclusionServiceError::ZkClientError(format!("Unhandled Error: {e} PLEASE REPORT"))
             })?;
+
         Ok(proof)
     }
 
@@ -540,7 +524,7 @@ impl InclusionService {
             .get_or_try_init(|| async {
                 debug!("Building DA client");
                 let client = CelestiaJSONClient::new(
-                    self.config.da_node_ws.as_str(),
+                    self.config.da_node_http.as_str(),
                     self.config.da_node_token.as_str().into(),
                 )
                 .await
