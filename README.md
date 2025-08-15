@@ -1,7 +1,7 @@
 # Data Availability Equivalence Service
 
 A gRPC service acting as a "cryptographic adapter" providing proofs that data (a blob) exists on [Celestia](https://celestia.org/) that are efficiently verifiable on EVM networks.
-A [Namespace Merkle Tree (NMT)](https://celestia.org/glossary/namespaced-merkle-tree/) proof is transformed via a [Zero Knowledge Proof (ZKP)](https://docs.succinct.xyz/docs/sp1/what-is-a-zkvm) into a keccak hash check.
+A [Namespace Merkle Tree (NMT)](https://celestia.org/glossary/namespaced-merkle-tree/) proof is transformed via a [Zero Knowledge Proof (ZKP)](https://dev.risczero.com/api/zkvm/) into a keccak hash check.
 
 A few key features:
 
@@ -45,8 +45,10 @@ The service **_requires_** a connection to:
    - Fetch blob data.
    - Get headers.
    - Retrieve Merkle tree proofs for blobs.
-1. [Succinct's prover network](https://docs.succinct.xyz/docs/sp1/prover-network/quickstart) as a provider to generate Zero-Knowledge Proofs (ZKPs) of data existing on Celestia.
-   _See the [ZKP program](./program-keccak-inclusion/src/main.rs) for details on what is proven._
+1. A chain hosting Boundless marketplace (Ethereum/Base) to:
+   - Submit proof requests and escrow eth to pay for proving
+   - Retrieve completed proofs
+   _See the [ZKP program](./program-keccak-inclusion/guest/src/main.rs) for details on what is proven._
 
 ## Interact
 
@@ -70,34 +72,34 @@ export EQ_PROTO_DIR="."
 # Fetching the Keccak inclusion proof for a specific Celestia commitment, namespace, and height
 grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
   -d '{height": <block height (integer)>", "namespace": "<your_namespace_hex>", commitment": "<your_commitment_hex>"}'
-  -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
+  -plaintext $EQ_SOCKET eqs.Inclusion.GetZKStack
 
 # Working examples using Celestia's mocha network
 
 # https://mocha.celenium.io/tx/e064ae79e06150ae75b37d3604c015d5698e173c52d0c2e3bf3203fe708e7513?tab=messages
 grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
   -d '{"height": 4214864, "namespace": "3q2+796tvu8=", "commitment":"YcARQRj9KE/7sSXd4090FAONKkPz9ajYKIZq8liv3A0="}' \
-  -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
+  -plaintext $EQ_SOCKET eqs.Inclusion.GetZKStack
 
 # https://mocha.celenium.io/tx/c3c301fe579feb908fe02e2e8549c38f23707d30a3d4aa73e26402d854ff9104
 grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
   -d '{"height": 4409088, "namespace": "XSUTEfJbE6VJ4A==", "commitment":"DYoAZpU7FrviV7Ui/AjQv0BpxCwexPWaOW/hQVpEl/s="}' \
-  -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
+  -plaintext $EQ_SOCKET eqs.Inclusion.GetZKStack
 
 # https://mocha.celenium.io/tx/6ead3f794b384a9f41f58e62be4d58822626add607eefcb7ab9f0dd6b70a6abe
 grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
   -d '{"height": 4499000, "namespace": "EV1P7ciRW7PodQ==", "commitment":"mV9udfLnkNqmG/3khk2/gH0wLPx/6RinVDCTV77X3Xw="}' \
-  -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
+  -plaintext $EQ_SOCKET eqs.Inclusion.GetZKStack
 
 # https://mocha.celenium.io/tx/30a274a332e812df43cef70f395c413df191857ed581b68c44f05a3c5c322312
 grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
   -d '{"height": 4499999, "namespace": "Ucwac9Zflfa95g==", "commitment":"S2iIifIPdAjQ33KPeyfAga26FSF3IL11WsCGtJKSOTA="}' \
-  -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
+  -plaintext $EQ_SOCKET eqs.Inclusion.GetZKStack
 
 # https://mocha.celenium.io/tx/36797fdd1faa19ef8df1a3d3ec1b0278eb784b0a8cc3d5cd94db10b254f3eb78
 grpcurl -import-path $EQ_PROTO_DIR -proto eqservice.proto \
   -d '{"height": 6692080, "namespace": "XSUTEfJbE6VJ4A==", "commitment":"iu5d9b+rtl5B/j2ju3hUqbJT0y/kcUV4gHUdCvU2Jn4="}' \
-  -plaintext $EQ_SOCKET eqs.Inclusion.GetKeccakInclusion
+  -plaintext $EQ_SOCKET eqs.Inclusion.GetZKStack
 ```
 
 ## Operate
@@ -115,10 +117,9 @@ To build and run, see [developing instructions](#develop)
    - Ports accessible (by default):
      - service listening at `50051`
      - Light client (local or remote) over `26658`
-     - Succinct prover network over `443`
    - **NOTE:** These requirements may be significantly more to respond under heavy load, please report if you have issues!
 
-1. A whitelisted key in your `env` for use with the Succinct prover network Key - [requested here](https://docs.succinct.xyz/docs/sp1/generating-proofs/prover-network).
+1. A funded ethereum account with enough Eth to pay for gas and proving fees
 
 1. A Celestia Light Node [installed](https://docs.celestia.org/how-to-guides/celestia-node) & [running](https://docs.celestia.org/tutorials/node-tutorial#auth-token) accessible on `localhost`, or elsewhere.
    Alternatively, use [an RPC provider](https://github.com/celestiaorg/awesome-celestia/?tab=readme-ov-file#node-operator-contributions) you trust.
@@ -169,7 +170,7 @@ docker run -d \
 First, some tooling is required:
 
 1. Rust & Cargo - [install instructions](https://www.rust-lang.org/tools/install)
-1. Succinct's SP1 zkVM Toolchain - [install instructions](https://docs.succinct.xyz/docs/sp1/getting-started/install)
+1. RISC Zero zkVM Toolchain - [install instructions](https://dev.risczero.com/api/zkvm/quickstart#1-install-the-risc-zero-toolchain)
 1. Protocol Buffers (Protobuf) compiler - [official examples](https://github.com/hyperium/tonic/tree/master/examples#examples) contain install instructions
 1. (Optional) Just - a modern alternative to `make` [installed](https://just.systems/man/en/packages.html)
 
@@ -227,7 +228,7 @@ mkdir -p $EQ_DB_PATH
 [docker|podman] run --rm -it -v $EQ_DB_PATH:$EQ_DB_PATH --env-file .env --env RUST_LOG=eq_service=debug --network=host -p $EQ_PORT:$EQ_PORT eq_service
 ```
 
-Importantly, the DB should persist, and the container must have access to connect to the DA light client (likely port 26658) and Succinct network ports (HTTPS over 443).
+Importantly, the DB should persist, and the container must have access to connect to the DA light client (likely port 26658) and Chain RPC for Boundless market ports.
 
 The images are built and published for [releases](https://github.com/celestiaorg/eq-service/releases) - see [running containers](#running-containers) for how to pull them.
 

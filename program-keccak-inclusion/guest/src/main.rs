@@ -1,21 +1,28 @@
 #![doc = include_str!("../README.md")]
 #![no_main]
 
-sp1_zkvm::entrypoint!(main);
+risc0_zkvm::guest::entry!(main);
+
 use celestia_types::{blob::Blob, hash::Hash, AppVersion, ShareProof};
 use eq_common::{ZKStackEqProofInput, ZKStackEqProofOutput};
+use risc0_zkvm::guest::env;
 use sha3::{Digest, Keccak256};
 
 pub fn main() {
     println!("cycle-tracker-start: deserialize input");
-    let input: ZKStackEqProofInput = sp1_zkvm::io::read();
+    let input: ZKStackEqProofInput = env::read();
     let data_root_as_hash = Hash::Sha256(input.data_root);
     println!("cycle-tracker-end: deserialize input");
 
     println!("cycle-tracker-start: create blob");
     let blob = match input.author {
-        Some(author) => Blob::new_with_signer(input.namespace_id, input.data, author, AppVersion::V5).expect("Failed creating blob"),
-        None => Blob::new(input.namespace_id, input.data, AppVersion::V5).expect("Failed creating blob"),
+        Some(author) => {
+            Blob::new_with_signer(input.namespace_id, input.data, author, AppVersion::V5)
+                .expect("Failed creating blob")
+        }
+        None => {
+            Blob::new(input.namespace_id, input.data, AppVersion::V5).expect("Failed creating blob")
+        }
     };
     println!("cycle-tracker-end: create blob");
 
@@ -57,6 +64,6 @@ pub fn main() {
         chain_id: input.chain_id,
     }
     .to_vec();
-    sp1_zkvm::io::commit_slice(&output);
+    env::commit_slice(&output);
     println!("cycle-tracker-end: commit output");
 }

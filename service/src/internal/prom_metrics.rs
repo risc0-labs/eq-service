@@ -63,10 +63,10 @@ impl PromMetrics {
         );
 
         let zk_proof_gen_timeout_float = Duration::from_secs(
-            std::env::var("PROOF_GEN_TIMEOUT_SECONDS")
-                .expect("PROOF_GEN_TIMEOUT_SECONDS env var required")
+            std::env::var("ORDER_TIMEOUT")
+                .expect("ORDER_TIMEOUT env var required")
                 .parse()
-                .expect("PROOF_GEN_TIMEOUT_SECONDS must be integer"),
+                .expect("ORDER_TIMEOUT must be integer"),
         )
         .as_secs_f64();
 

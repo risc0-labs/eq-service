@@ -2,6 +2,7 @@
 
 mod internal;
 use eq_common::eqs::inclusion_server::InclusionServer;
+use eq_program_keccak_inclusion_builder::EQ_PROGRAM_KECCAK_INCLUSION_ID;
 use internal::grpc::InclusionServiceArc;
 use internal::inclusion::*;
 use internal::job::*;
@@ -18,15 +19,12 @@ use tonic::transport::Server;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    std::env::var("NETWORK_PRIVATE_KEY")
-        .expect("NETWORK_PRIVATE_KEY for Succinct Prover env var required");
-    let da_node_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN")
-        .expect("CELESTIA_NODE_AUTH_TOKEN env var required");
-    let zk_proof_gen_timeout = Duration::from_secs(
-        std::env::var("PROOF_GEN_TIMEOUT_SECONDS")
-            .expect("PROOF_GEN_TIMEOUT_SECONDS env var required")
+    let da_node_token = std::env::var("CELESTIA_NODE_AUTH_TOKEN").ok();
+    let _zk_proof_gen_timeout = Duration::from_secs(
+        std::env::var("ORDER_TIMEOUT")
+            .expect("ORDER_TIMEOUT env var required")
             .parse()
-            .expect("PROOF_GEN_TIMEOUT_SECONDS must be integer"),
+            .expect("ORDER_TIMEOUT must be integer"),
     );
     let da_node_http =
         std::env::var("CELESTIA_NODE_HTTP").expect("CELESTIA_NODE_HTTP env var required");
@@ -51,7 +49,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         InclusionServiceConfig {
             da_node_token,
             da_node_http,
-            zk_proof_gen_timeout,
         },
         OnceCell::new(),
         OnceCell::new(),
@@ -78,11 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn({
         let service = inclusion_service.clone();
         async move {
-            let program_id = get_program_id().await;
-            info!("zkstack-inclusion program id: {}", hex::encode(&program_id));
+            info!(
+                "zkstack-inclusion program id: {:?}",
+                EQ_PROGRAM_KECCAK_INCLUSION_ID
+            );
             let zk_client = service.clone().get_zk_client_remote().await;
-            debug!("ZK client prepared, acquiring setup");
-            let _ = service.get_proof_setup(&program_id, zk_client).await;
             info!("ZK client ready!");
         }
         // TODO: crash whole program if this fails

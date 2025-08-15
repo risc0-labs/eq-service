@@ -21,19 +21,21 @@ repository = "https://github.com/celestiaorg/eq-service"
 [workspace.dependencies]
 eq-common = { path = "common", version = "0.1.11" }
 eq-sdk = { path = "sdk", version = "0.1.11" }
+eq-program-keccak-inclusion-builder = { path = "program-keccak-inclusion" }
 
+boundless-market = "0.13"
 clap = "4.5"
 celestia-types = "0.13"
 celestia-rpc = "0.11"
 nmt-rs = "0.2"
-sp1-zkvm = { version = "5.2", features = ["verify"] }
-sp1-sdk = { version = "5.2" }
+risc0-build = { version = "2.3.1" }
+risc0-zkvm = { version = "2.3.1" }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 sha3 = "0.10"
 tendermint-proto = "0.40"
 tendermint = "0.40"
 bincode = "1.3"
-tokio = { version = "1.45", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "signal"] }
 hex = "0.4"
 serde_json = "1.0"
 thiserror = "2.0"
@@ -49,11 +51,3 @@ prometheus-client = "0.23"
 hyper = "1.6"
 hyper-util = "0.1"
 http-body-util = "0.1"
-
-[patch.crates-io]
-# TODO: update to 5.0?
-sha3-v0-10-8 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha3", branch = "patch-sha3-v0.10.8" }
-sha2-v0-9-9 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.9.9-sp1-4.0.0" }
-sha2-v0-10-8 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.10.8-sp1-4.0.0" }
-tiny-keccak = { git = "https://github.com/sp1-patches/tiny-keccak", tag = "patch-2.0.2-sp1-4.0.0" }
-curve25519-dalek-ng = { git = "https://github.com/sp1-patches/curve25519-dalek-ng", tag = "patch-4.1.1-sp1-4.0.0" }

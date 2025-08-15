@@ -60,8 +60,8 @@ impl Inclusion for InclusionServiceArc {
                     return Ok(Response::new(GetZkStackResponse {
                         status: ResponseStatus::ZkpFinished as i32,
                         response_value: Some(ResponseValue::Proof(ProofWithPublicValues {
-                            proof_data: proof.bytes(),
-                            public_values: proof.public_values.to_vec(),
+                            proof_data: proof.seal.to_vec(),
+                            public_values: proof.journal.to_vec(),
                         })),
                     }));
                 }
@@ -140,7 +140,10 @@ impl Inclusion for InclusionServiceArc {
                 JobStatus::ZkProofPending(job_id) => {
                     return Ok(Response::new(GetZkStackResponse {
                         status: ResponseStatus::ZkpPending as i32,
-                        response_value: Some(ResponseValue::ProofId(job_id.to_vec())),
+                        response_value: Some(ResponseValue::ProofId(
+                            bincode::serialize(&job_id)
+                                .map_err(|e| Status::internal(e.to_string()))?,
+                        )),
                     }));
                 }
                 _ => {

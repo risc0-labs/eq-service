@@ -1,5 +1,5 @@
 [package]
-name = "eq-program-keccak-inclusion"
+name = "eq-program-keccak-inclusion-builder"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -7,10 +7,8 @@ homepage.workspace = true
 repository.workspace = true
 publish = false
 
-[dependencies]
-# TODO: use workspace version, cannot override default feats though... 
-eq-common = { path = "../common", default-features = false }
+[build-dependencies]
+risc0-build = { workspace = true }
 
-sp1-zkvm = { workspace = true }
-celestia-types = { workspace = true }
-sha3 = { workspace = true }
+[package.metadata.risc0]
+methods = ["guest"]

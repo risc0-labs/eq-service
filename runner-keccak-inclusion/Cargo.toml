@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-sp1-sdk.workspace = true
+risc0-zkvm.workspace = true
 eq-common.workspace = true
 serde_json.workspace = true
+eq-program-keccak-inclusion-builder.workspace = true

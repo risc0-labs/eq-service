@@ -11,6 +11,7 @@ publish = false
 eq-common = { workspace = true, features = ["host"] }
 eq-sdk.workspace = true
 
+boundless-market = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 bincode = { workspace = true }
 celestia-types = { workspace = true }
@@ -18,13 +19,13 @@ celestia-rpc = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
 sled = { workspace = true }
-sp1-sdk = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
 hex = { workspace = true }
 jsonrpsee = { workspace = true }
 sha3 = { workspace = true }
 prometheus-client = { workspace = true }
-hyper = { workspace = true }
+hyper = { workspace = true, features = ["server"] }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
+eq-program-keccak-inclusion-builder.workspace = true
